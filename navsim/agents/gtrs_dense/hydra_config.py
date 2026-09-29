@@ -100,6 +100,15 @@ class HydraConfig(TransfuserConfig):
     backbone_wd: float = 0.0
     weight_decay: float = 0.0
 
+    # Distance-sampled path. Off by default so existing checkpoints are unchanged.
+    # spatial_freeze trains only the new head. spatial_path_follow rewrites the
+    # executed trajectory onto that path at inference.
+    spatial_path: bool = False
+    spatial_freeze: bool = True
+    spatial_path_follow: bool = True
+    spatial_gt_path: str = "/ai/ys/navsim_exp/spatial_path_navtrain.npz"
+    spatial_anchor_path: str = "/ai/ys/navsim_exp/spatial_path_anchors.npz"
+
     # lidar backbone
     lidar_architecture: str = "resnet34"
 
