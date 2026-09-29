@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from navsim.agents.gtrs_dense.hydra_backbone import HydraBackbone
 from navsim.agents.gtrs_dense.hydra_config import HydraConfig
+from navsim.agents.gtrs_dense.spatial_path import SpatialPathHead, follow_spatial_path
 from navsim.agents.transfuser.transfuser_model import AgentHead
 from navsim.agents.utils.attn import MemoryEffTransformer
 from navsim.agents.utils.nerf import nerf_positional_encoding
@@ -71,6 +72,14 @@ class HydraModel(nn.Module):
             vocab_path=config.vocab_path,
             config=config
         )
+        self._spatial_head = None
+        if config.spatial_path:
+            self._spatial_head = SpatialPathHead(
+                d_model=config.tf_d_model,
+                d_ffn=config.tf_d_ffn,
+                nhead=config.tf_num_head,
+                anchor_path=config.spatial_anchor_path,
+            )
 
 
     def img_feat_blc(self, camera_feature):
@@ -128,6 +137,17 @@ class HydraModel(nn.Module):
         output: Dict[str, torch.Tensor] = {}
         trajectory = self._trajectory_head(keyval, status_encoding, interpolated_traj)
         output.update(trajectory)
+        if self._spatial_head is not None:
+            bev = keyval.detach() if self._config.spatial_freeze else keyval
+            status = status_encoding.detach() if self._config.spatial_freeze else status_encoding
+            raw_status = status_feature[:, :8] if status_feature.shape[-1] != 8 else status_feature
+            command = raw_status[:, :4].argmax(dim=-1)
+            output.update(self._spatial_head(bev, status, command))
+            if (not self.training) and self._config.spatial_path_follow:
+                output["trajectory_scored"] = output["trajectory"]
+                output["trajectory"] = follow_spatial_path(
+                    output["trajectory"], output["spatial_path"]
+                )
         return output
 
 

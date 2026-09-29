@@ -31,6 +31,7 @@ from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.gtrs_dense.hydra_config import HydraConfig
 from navsim.agents.gtrs_dense.hydra_features import HydraFeatureBuilder, HydraTargetBuilder
 from navsim.agents.gtrs_dense.hydra_model import HydraModel
+from navsim.agents.gtrs_dense.spatial_path import spatial_path_loss
 from navsim.common.dataclasses import SensorConfig
 from navsim.planning.training.abstract_feature_target_builder import (
     AbstractFeatureBuilder,
@@ -189,6 +190,10 @@ class GTRSAgent(AbstractAgent):
             self.model = HydraModel(config)
         else:
             raise ValueError('Unsupported hydra version')
+        if self._config.spatial_path and self._config.spatial_freeze:
+            for name, param in self.model.named_parameters():
+                if "_spatial_head" not in name:
+                    param.requires_grad = False
         self.vocab_size = config.vocab_size
         self.backbone_wd = config.backbone_wd
         self.scheduler = config.scheduler
@@ -248,29 +253,40 @@ class GTRSAgent(AbstractAgent):
             predictions: Dict[str, torch.Tensor],
             tokens=None
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self._config.spatial_path and self._config.spatial_freeze:
+            return spatial_path_loss(
+                predictions, targets, tokens=tokens, gt_path=self._config.spatial_gt_path)
         # get the pdm score by tokens
         scores = {}
         for k in self.metrics:
             tmp = [self.vocab_pdm_score_full[token][k][None] for token in tokens]
             scores[k] = (torch.from_numpy(np.concatenate(tmp, axis=0))
                          .to(predictions['trajectory'].device))
-        return hydra_kd_imi_agent_loss_dropout(targets, predictions, self._config, scores,
-                                               regression_ep=self._config.regression_ep,
-                                               three2two=self._config.three2two)
+        loss, loss_dict = hydra_kd_imi_agent_loss_dropout(targets, predictions, self._config, scores,
+                                                          regression_ep=self._config.regression_ep,
+                                                          three2two=self._config.three2two)
+        if self._config.spatial_path:
+            spatial_loss, spatial_dict = spatial_path_loss(
+                predictions, targets, tokens=tokens, gt_path=self._config.spatial_gt_path)
+            loss = loss + spatial_loss
+            loss_dict.update(spatial_dict)
+        return loss, loss_dict
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
+        named = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad]
         backbone_params_name = '_backbone.image_encoder'
         img_backbone_params = list(
-            filter(lambda kv: backbone_params_name in kv[0], self.model.named_parameters()))
-        default_params = list(filter(lambda kv: backbone_params_name not in kv[0], self.model.named_parameters()))
-        params_lr_dict = [
-            {'params': [tmp[1] for tmp in default_params]},
-            {
+            filter(lambda kv: backbone_params_name in kv[0], named))
+        default_params = list(filter(lambda kv: backbone_params_name not in kv[0], named))
+        params_lr_dict = []
+        if default_params:
+            params_lr_dict.append({'params': [tmp[1] for tmp in default_params]})
+        if img_backbone_params:
+            params_lr_dict.append({
                 'params': [tmp[1] for tmp in img_backbone_params],
                 'lr': self._lr * self._config.lr_mult_backbone,
                 'weight_decay': self.backbone_wd
-            }
-        ]
+            })
         if self.scheduler == 'default':
             return torch.optim.Adam(params_lr_dict, lr=self._lr, weight_decay=self._config.weight_decay)
         elif self.scheduler == 'cycle':
