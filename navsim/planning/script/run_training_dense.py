@@ -31,11 +31,32 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
+from navsim.planning.training.prefetch import build_train_dataloader, prefetch_enabled
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
+
+
+class TrainValData(pl.LightningDataModule):
+    """
+    Holds the training DataLoader and builds the validation DataLoader only when Lightning requests it.
+    With persistent_workers=False, validation workers and their batches exist only while validation runs,
+    so they never pile up on top of the training prefetch queue for the whole run.
+    """
+
+    def __init__(self, train_dataloader: DataLoader, val_data: Dataset, val_params: dict):
+        super().__init__()
+        self._train_dataloader = train_dataloader
+        self._val_data = val_data
+        self._val_params = val_params
+
+    def train_dataloader(self) -> DataLoader:
+        return self._train_dataloader
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(self._val_data, **self._val_params, shuffle=False)
 
 
 def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Dataset]:
@@ -144,9 +165,24 @@ def main(cfg: DictConfig) -> None:
         train_data, val_data = build_datasets(cfg, agent)
 
     logger.info("Building Datasets")
-    train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True)
+    # optional: +dataloader.prefetch_queue.{enabled,depth,ram_budget_gb,decode_threads}; env vars otherwise
+    queue_cfg = cfg.dataloader.get("prefetch_queue", None) or {}
+    queue_on = prefetch_enabled(queue_cfg.get("enabled", None))
+    train_dataloader = build_train_dataloader(
+        train_data,
+        enabled=queue_on,
+        queue_depth=queue_cfg.get("depth", None),
+        ram_budget_gb=queue_cfg.get("ram_budget_gb", None),
+        decode_threads=queue_cfg.get("decode_threads", None),
+        **cfg.dataloader.params,
+        shuffle=True,
+    )
     logger.info("Num training samples: %d", len(train_data))
-    val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False)
+    val_params = dict(cfg.dataloader.params)
+    val_params["persistent_workers"] = False
+    if queue_on and val_params.get("num_workers", 0) > 0:
+        val_params["prefetch_factor"] = 1
+    data = TrainValData(train_dataloader, val_data, val_params)
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
@@ -162,8 +198,7 @@ def main(cfg: DictConfig) -> None:
     logger.info("Starting Training")
     trainer.fit(
         model=lightning_module,
-        train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader,
+        datamodule=data,
         ckpt_path=cfg.get('resume_ckpt_path', None)
     )
 
