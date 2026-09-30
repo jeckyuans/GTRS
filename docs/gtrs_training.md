@@ -69,6 +69,24 @@ MASTER_PORT=29500 MASTER_ADDR=${MASTER_ADDR} WORLD_SIZE=${NUM_NODES} NODE_RANK=$
 ```
 
 
+### Bounded batch prefetch queue (optional)
+
+If decoding the gzip cache is slower than a training step, `run_training_dense.py` can serve training batches from a bounded
+queue of already decoded batches (`navsim/planning/training/prefetch.py`). It is off by default. Enable it with
+`NAVSIM_PREFETCH_QUEUE=1` or `+dataloader.prefetch_queue.enabled=true`:
+
+| Env var / `+dataloader.prefetch_queue.*` | Default | Meaning |
+|---|---|---|
+| `NAVSIM_PREFETCH_DEPTH` / `depth` | 8 | decoded batches queued per rank; the first step of each epoch waits until the queue is full |
+| `NAVSIM_PREFETCH_RAM_GB` / `ram_budget_gb` | 20 | host-RAM budget for the queue **per rank**; the depth shrinks if `depth x largest batch` exceeds it (`<= 0` disables the cap) |
+| `NAVSIM_PREFETCH_DECODE_THREADS` / `decode_threads` | 1 | threads per worker process decoding the samples of one batch concurrently |
+
+With the queue on, `prefetch_factor` is forced to 1, so host memory per rank is about
+`(depth + num_workers + 1) x batch size in bytes`. Decoders keep up when `GPU_NUM x num_workers x decode_threads / sample decode time`
+exceeds `GPU_NUM x batch_size / step time`. Keep `GPU_NUM x num_workers` within the CPU cores and raise `decode_threads` rather than
+the number of worker processes. The validation DataLoader is built through a LightningDataModule with `persistent_workers=False`,
+so its workers and batches exist only while validation runs.
+
 ## GTRS-Aug
 
 The training hyper-parameters of GTRS-Aug is slightly different from the previous models, but consistent with [DriveSuprim](https://www.arxiv.org/abs/2506.06659):
