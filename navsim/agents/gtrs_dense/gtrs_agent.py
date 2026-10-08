@@ -203,7 +203,10 @@ class GTRSAgent(AbstractAgent):
 
     def initialize(self) -> None:
         """Inherited, see superclass."""
-        state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))["state_dict"]
+        # weights_only=False: torch 2.6 rejects the checkpoint metadata by default.
+        state_dict: Dict[str, Any] = torch.load(
+            self._checkpoint_path, map_location=torch.device("cpu"), weights_only=False
+        )["state_dict"]
         # Remove keys containing 'model._trajectory_head.vocab'
         keys_to_delete = [k for k in state_dict if "model._trajectory_head.vocab" in k]
         for k in keys_to_delete:

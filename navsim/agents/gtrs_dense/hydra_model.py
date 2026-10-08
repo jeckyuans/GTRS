@@ -19,8 +19,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from navsim.agents.gtrs_dense.candidate_utility import CandidateUtilityHead, candidate_geometry
 from navsim.agents.gtrs_dense.hydra_backbone import HydraBackbone
 from navsim.agents.gtrs_dense.hydra_config import HydraConfig
+from navsim.agents.gtrs_dense.prefix_progress import (
+    PrefixProgressHead, prefix_candidate_arcs, prefix_utility_log_score,
+)
+from navsim.agents.gtrs_dense.spatial_path import SpatialPathHead, front_view_columns
 from navsim.agents.transfuser.transfuser_model import AgentHead
 from navsim.agents.utils.attn import MemoryEffTransformer
 from navsim.agents.utils.nerf import nerf_positional_encoding
@@ -71,6 +76,33 @@ class HydraModel(nn.Module):
             vocab_path=config.vocab_path,
             config=config
         )
+        self._spatial_head = None
+        if config.spatial_path:
+            if not config.spatial_anchor_path:
+                raise ValueError(
+                    "spatial_path requires spatial_anchor_path; "
+                    "see scripts/inference/frozen_gtrs_paths.sh")
+            self._spatial_head = SpatialPathHead(
+                d_model=config.tf_d_model,
+                d_ffn=config.tf_d_ffn,
+                nhead=config.tf_num_head,
+                anchor_path=config.spatial_anchor_path,
+                in_channels=config.tf_d_model,
+            )
+        self._candidate_utility_head = None
+        if config.candidate_utility:
+            if self._spatial_head is None:
+                raise ValueError("candidate_utility requires spatial_path=True and its predicted path")
+            self._candidate_utility_head = CandidateUtilityHead(
+                query_dim=config.tf_d_model,
+                hidden_dim=config.candidate_utility_hidden_dim,
+            )
+        self._prefix_progress_head = None
+        if config.prefix_progress:
+            if self._candidate_utility_head is None:
+                raise ValueError("prefix_progress requires candidate_utility=True")
+            self._prefix_progress_head = PrefixProgressHead(
+                query_dim=config.tf_d_model, hidden_dim=config.prefix_progress_hidden_dim)
 
 
     def img_feat_blc(self, camera_feature):
@@ -106,6 +138,8 @@ class HydraModel(nn.Module):
 
     def forward(self, features: Dict[str, torch.Tensor],
                 interpolated_traj=None) -> Dict[str, torch.Tensor]:
+        if self._candidate_utility_head is not None:
+            return self._forward_frozen_r1(features, interpolated_traj)
         status_feature: torch.Tensor = features["status_feature"][0]
         camera_feature = features["camera_feature"]
 
@@ -129,6 +163,106 @@ class HydraModel(nn.Module):
         trajectory = self._trajectory_head(keyval, status_encoding, interpolated_traj)
         output.update(trajectory)
         return output
+
+    def _forward_frozen_r1(self, features, interpolated_traj=None):
+        """Select the vocabulary row with the frozen R1 score.
+
+        S = logsigmoid(z_route) + logsigmoid(z_NC + d_NC) + logsigmoid(z_DAC + d_DAC)
+            + mean(logsigmoid(prefix at 0.5/1/2/4 s)).
+        The EP residual is computed and stored, and the original 8-head argmax
+        stays in trajectory_scored. trajectory is the S argmax.
+        """
+        if self.training:
+            raise RuntimeError("this submission only runs the frozen R1 selector at inference")
+        if self._prefix_progress_head is None:
+            raise RuntimeError("frozen R1 selection requires prefix_progress=True")
+        with torch.inference_mode():
+            output, front = self._trunk_forward(features, interpolated_traj)
+            status = features["status_feature"]
+            status = status[0] if isinstance(status, (list, tuple)) else status
+            self._append_spatial(output, front, status)
+            candidates = output["candidate_trajectories"]
+            geometry_parts = []
+            for start in range(0, candidates.shape[-3], 1024):
+                part = (candidates[start:start + 1024] if candidates.ndim == 3
+                        else candidates[:, start:start + 1024])
+                geometry_parts.append(candidate_geometry(part, output["spatial_path"]))
+            geometry = torch.cat(geometry_parts, dim=1)
+            base_logits = torch.stack(
+                (output["no_at_fault_collisions"],
+                 output["drivable_area_compliance"],
+                 output["ego_progress"]), dim=-1)
+            row_ids = output["candidate_utility_vocab_ids"]
+            candidate_features = output["candidate_utility_features"]
+            if status.shape[-1] < 6:
+                raise ValueError("prefix_progress requires ego status velocity at columns 4:6")
+            ego_velocity = status[:, 4:6]
+            prefix_candidates = candidates[None].expand(candidate_features.shape[0], -1, -1, -1)
+            candidate_arcs = prefix_candidate_arcs(prefix_candidates)
+        output["candidate_utility_vocab_ids"] = row_ids
+        output["candidate_utility_geometry"] = geometry.clone()
+        output["candidate_utility_base_logits"] = base_logits.clone()
+        output["candidate_utility_features"] = candidate_features.clone()
+        with torch.no_grad():
+            output.update(self._candidate_utility_head(
+                output["candidate_utility_features"],
+                output["candidate_utility_base_logits"],
+                output["candidate_utility_geometry"],
+            ))
+        output["prefix_candidate_arcs"] = candidate_arcs.clone()
+        output["prefix_ego_velocity"] = ego_velocity.clone()
+        output.update(self._prefix_progress_head(
+            output["candidate_utility_features"].detach(),
+            output["candidate_utility_geometry"].detach(),
+            output["prefix_candidate_arcs"].detach(),
+            output["prefix_ego_velocity"].detach(),
+        ))
+        output["prefix_utility_log_scores"] = prefix_utility_log_score(
+            output["candidate_utility_logits"].detach(),
+            output["prefix_progress_log_score"],
+        )
+        index = output["prefix_utility_log_scores"].argmax(dim=1)
+        output["trajectory_scored"] = output["trajectory"]
+        output["selected_indices_scored"] = output["selected_indices"]
+        output["selected_indices"] = output["candidate_utility_vocab_ids"][index]
+        output["trajectory"] = self._trajectory_head.vocab[index]
+        return output
+
+    def _trunk_forward(self, features, interpolated_traj=None):
+        status_feature = features["status_feature"]
+        status_feature = status_feature[0] if isinstance(status_feature, (list, tuple)) else status_feature
+        if self._config.num_ego_status == 1 and status_feature.shape[1] == 32:
+            status_encoding = self._status_encoding(status_feature[:, :8])
+        else:
+            status_encoding = self._status_encoding(status_feature)
+        camera_feature = features["camera_feature"]
+        if isinstance(camera_feature, list):
+            camera_feature = camera_feature[-1]
+        img_features = self.img_feat_blc(camera_feature)
+        if self._config.use_back_view:
+            img_features_back = self.img_feat_blc(features["camera_feature_back"])
+            img_features = torch.cat([img_features, img_features_back], 1)
+        front = self._front_view(img_features)
+        keyval = img_features + self._keyval_embedding.weight[None, ...]
+        output: Dict[str, torch.Tensor] = {}
+        output.update(self._trajectory_head(keyval, status_encoding, interpolated_traj))
+        return output, front
+
+    def _front_view(self, img_features):
+        height, width = self._config.img_vert_anchors, self._config.img_horz_anchors
+        grid = img_features[:, :height * width].reshape(-1, height, width, img_features.shape[-1])
+        start, stop = front_view_columns(width)
+        return grid[:, :, start:stop].permute(0, 3, 1, 2).contiguous()
+
+    def _append_spatial(self, output, front, status_feature):
+        if self._config.spatial_freeze:
+            front = front.detach()
+        plan_query = output.pop("spatial_plan_query", None)
+        if plan_query is not None:
+            plan_query = plan_query.detach()
+        raw_status = status_feature[:, :8] if status_feature.shape[-1] != 8 else status_feature
+        command = raw_status[:, :4].argmax(dim=-1)
+        output.update(self._spatial_head(front, plan_query, command))
 
 
 class HydraTrajHead(nn.Module):
@@ -229,7 +363,7 @@ class HydraTrajHead(nn.Module):
         L, HORIZON, _ = vocab.shape
         B = bev_feature.shape[0]
         num_total = vocab.size(0)  # 16384
-        if self.training and self.config.vocab_dropout:
+        if self.training and self.config.vocab_dropout and not self.config.candidate_utility:
             num_select = num_total // 2  # 8192
             indices = torch.randperm(num_total, device=vocab.device)[:num_select]
             vocab = vocab[indices]
@@ -254,6 +388,9 @@ class HydraTrajHead(nn.Module):
             embedded_vocab = self.pos_embed(vocab.view(L, -1))[None].repeat(B, 1, 1)
         tr_out = self.transformer(embedded_vocab, bev_feature)
         dist_status = tr_out + status_encoding.unsqueeze(1)
+        if self.config.candidate_utility:
+            result["candidate_utility_features"] = dist_status
+            result["candidate_utility_vocab_ids"] = result["dropout_indices"]
 
         # selected_indices: B,
         for k, head in self.heads.items():
@@ -276,6 +413,14 @@ class HydraTrajHead(nn.Module):
         result["trajectory"] = self.vocab.data[selected_indices]
         result["trajectory_vocab"] = self.vocab.data
         result["selected_indices"] = selected_indices
+        if self.config.spatial_path:
+            result["candidate_scores"] = scores
+            result["candidate_trajectories"] = result["trajectory_vocab_dropout"]
+            topk = self.config.spatial_plan_topk
+            if topk > 0:
+                top = scores.topk(min(topk, scores.shape[1]), dim=1).indices
+                result["spatial_plan_query"] = dist_status.gather(
+                    1, top[..., None].expand(-1, -1, dist_status.shape[-1]))
         return result
 
     def eval_dp_proposals(self, bev_feature,

@@ -1,0 +1,47 @@
+# Frozen R1 selector on the VoV backbone.
+# Temporary absolute paths are set by scripts/inference/frozen_gtrs_paths.sh.
+# agent=gtrs_dense_vov keeps the original 8-head argmax.
+
+_target_: navsim.agents.gtrs_dense.gtrs_agent.GTRSAgent
+_convert_: 'all'
+pdm_gt_path: null
+
+config:
+  _target_: navsim.agents.gtrs_dense.hydra_config.HydraConfig
+  _convert_: 'all'
+  vocab_path: ${oc.env:GTRS_VOCAB_PATH}
+  ckpt_path: hydra_plus_16384_ckpt
+  vocab_size: 16384
+  lidar_seq_len: 4
+  sigma: 0.5
+  trajectory_imi_weight: 1.0
+  progress_weight: 2.0
+
+  vocab_dropout: True
+  normalize_vocab_pos: True
+
+  camera_width: 2048
+  camera_height: 512
+  img_vert_anchors: 16
+  img_horz_anchors: 64
+  backbone_type: 'vov'
+  vov_ckpt: ${oc.env:OPENSCENE_DATA_ROOT}/models/dd3d_det_final.pth
+  lr_mult_backbone: 1.0
+
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    time_horizon: 4
+    interval_length: 0.1
+
+  spatial_path: true
+  spatial_freeze: true
+  spatial_plan_topk: 32
+  spatial_anchor_path: ${oc.env:GTRS_SPATIAL_ANCHOR_PATH}
+  candidate_utility: true
+  candidate_utility_hidden_dim: 128
+  prefix_progress: true
+  prefix_progress_hidden_dim: 128
+
+checkpoint_path: ${oc.env:GTRS_R1_CHECKPOINT}
+lr: 1e-4
