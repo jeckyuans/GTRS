@@ -14,10 +14,12 @@
 # limitations under the License.
 
 import logging
+import multiprocessing
 import os
 import pickle
 import traceback
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
@@ -32,8 +34,8 @@ from hydra.utils import instantiate
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.geometry.convert import relative_to_absolute_poses
 from nuplan.planning.script.builders.logging_builder import build_logger
-from nuplan.planning.utils.multithreading.worker_utils import worker_map
-from omegaconf import DictConfig
+from nuplan.planning.utils.multithreading.worker_utils import chunk_list, worker_map
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from navsim.agents.abstract_agent import AbstractAgent
@@ -54,6 +56,65 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score_gpu"
+_SCORE_MODULE = "navsim.planning.script.run_pdm_score_gpu_v2"
+
+
+def worker_uses_process_pool(cfg: DictConfig) -> bool:
+    """True only when Hydra sets ``worker.use_process_pool``. A missing key stays on ``worker_map``."""
+    return bool(OmegaConf.select(cfg, "worker.use_process_pool", default=False))
+
+
+def resolve_pdm_worker_count(cfg: DictConfig) -> int:
+    """Use ``worker.max_workers``, or all logical CPUs when that value is null (nuplan's rule)."""
+    raw = OmegaConf.select(cfg, "worker.max_workers", default=None)
+    if raw is None:
+        from nuplan.planning.utils.multithreading.worker_pool import WorkerResources
+
+        return int(WorkerResources.current_node_cpu_count())
+    return int(raw)
+
+
+def slice_model_trajectories(merged_predictions: Dict, tokens: List[str]) -> Dict:
+    """Keep ``model_trajectory[token]["trajectory"]`` for the requested tokens.
+
+    Reactive scoring never reads the imi head or vocab-score tensors that sit beside ``trajectory``.
+    """
+    sliced: Dict = {}
+    for token in tokens:
+        if token not in merged_predictions:
+            continue
+        payload = merged_predictions[token]
+        try:
+            trajectory = payload["trajectory"]
+        except (KeyError, TypeError):
+            continue
+        sliced[token] = {"trajectory": trajectory}
+    return sliced
+
+
+def merge_model_trajectories(args: List[Dict]) -> Dict:
+    """Union per-log trajectory slices inside one worker chunk.
+
+    ``run_pdm_score`` used to read only ``args[0]["model_trajectory"]``, which worked when every
+    task carried the full prediction dict. A sliced task has to be combined with the rest of the chunk.
+    """
+    merged: Dict = {}
+    for point in args:
+        merged.update(point["model_trajectory"])
+    return merged
+
+
+def build_pdm_score_data_points(cfg: DictConfig, merged_predictions: Dict, tokens_per_log: Dict) -> List[Dict]:
+    """One task per log, with that log's trajectories only."""
+    return [
+        {
+            "cfg": cfg,
+            "log_file": log_file,
+            "tokens": tokens_list,
+            "model_trajectory": slice_model_trajectories(merged_predictions, tokens_list),
+        }
+        for log_file, tokens_list in tokens_per_log.items()
+    ]
 
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[pd.DataFrame]:
@@ -68,7 +129,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
     log_names = [a["log_file"] for a in args]
     tokens = [t for a in args for t in a["tokens"]]
     cfg: DictConfig = args[0]["cfg"]
-    model_trajectory = args[0]['model_trajectory']
+    model_trajectory = merge_model_trajectories(args)
 
     simulator: PDMSimulator = instantiate(cfg.simulator)
     scorer: PDMScorer = instantiate(cfg.scorer)
@@ -191,6 +252,75 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
     return pdm_results
 
 
+def _importable_run_pdm_score():
+    """Return ``run_pdm_score`` from its package module so spawn workers can unpickle it.
+
+    ``python path/to/run_pdm_score_gpu_v2.py`` stores the function on ``__main__``. A spawned
+    interpreter imports the package path instead of re-running that script.
+    """
+    if run_pdm_score.__module__ == _SCORE_MODULE:
+        return run_pdm_score
+    import importlib
+
+    return importlib.import_module(_SCORE_MODULE).run_pdm_score
+
+
+def _restore_env(name: str, previous: Union[str, None]) -> None:
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
+
+
+def score_with_spawn_pool(cfg: DictConfig, data_points: List[Dict], executor_factory=None, score_fn=None):
+    """Run ``run_pdm_score`` on chunks with ``ProcessPoolExecutor(mp_context=spawn)``.
+
+    Opt in with ``worker=single_machine_thread_pool worker.use_process_pool=true worker.max_workers=32``.
+    nuplan's process pool forks and is not used. ``max_workers`` null still means all logical CPUs.
+    A non-positive count matches ``worker_map`` and scores the full task list in this process.
+    GPU visibility is cleared only while workers start, so importing torch in a child does not
+    allocate a CUDA context next to the parent that just finished ``trainer.predict``.
+    """
+    if executor_factory is None:
+        executor_factory = ProcessPoolExecutor
+    if score_fn is None:
+        score_fn = _importable_run_pdm_score()
+    if not data_points:
+        return []
+    max_workers = resolve_pdm_worker_count(cfg)
+    if max_workers <= 0:
+        return score_fn(data_points)
+
+    chunks = chunk_list(data_points, max_workers)
+    if not chunks:
+        return []
+    ctx = multiprocessing.get_context("spawn")
+    previous_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        worker_count = min(max_workers, len(chunks))
+        logger.info("PDM score spawn pool: %d workers, %d chunks", worker_count, len(chunks))
+        with executor_factory(max_workers=worker_count, mp_context=ctx) as executor:
+            nested = executor.map(score_fn, chunks)
+            return [row for rows in nested for row in rows]
+    finally:
+        _restore_env("CUDA_VISIBLE_DEVICES", previous_cuda)
+
+
+def collect_pdm_score_rows(
+    cfg: DictConfig,
+    data_points: List[Dict],
+    worker_map_fn=worker_map,
+    build_worker_fn=build_worker,
+    spawn_fn=score_with_spawn_pool,
+):
+    """Keep today's ``worker_map`` path unless ``worker.use_process_pool`` is set."""
+    if worker_uses_process_pool(cfg):
+        return spawn_fn(cfg, data_points)
+    worker = build_worker_fn(cfg)
+    return worker_map_fn(worker, run_pdm_score, data_points)
+
+
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
 def main(cfg: DictConfig) -> None:
     """
@@ -277,18 +407,13 @@ def main(cfg: DictConfig) -> None:
 
     pickle.dump(merged_predictions, open(dump_path, 'wb'))
 
-    data_points = [
-        {
-            "cfg": cfg,
-            "log_file": log_file,
-            "tokens": tokens_list,
-            "model_trajectory": merged_predictions
-        }
-        for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
-    ]
-
-    worker = build_worker(cfg)
-    score_rows: List[pd.DataFrame] = worker_map(worker, run_pdm_score, data_points)
+    data_points = build_pdm_score_data_points(cfg, merged_predictions, scene_loader.get_tokens_list_per_log())
+    logger.info(
+        "PDM score over %d logs (spawn process pool=%s)",
+        len(data_points),
+        worker_uses_process_pool(cfg),
+    )
+    score_rows: List[pd.DataFrame] = collect_pdm_score_rows(cfg, data_points)
 
     pdm_score_df = pd.concat(score_rows)
 
