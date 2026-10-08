@@ -75,7 +75,6 @@ def _original_scores(prediction):
 
 
 def _forward(agent, features, device):
-    agent.eval()
     with torch.no_grad():
         return agent.forward(_to_device(features, device))
 
@@ -95,6 +94,8 @@ def main(cfg: DictConfig) -> None:
 
     r1_agent = instantiate(cfg.agent)
     r1_agent.initialize()
+    r1_agent.to(device)
+    r1_agent.eval()
     if r1_agent.model._prefix_progress_head is None or r1_agent.model._candidate_utility_head is None:
         raise RuntimeError("R1 checkpoint was loaded without the frozen selector heads")
 
@@ -105,6 +106,8 @@ def main(cfg: DictConfig) -> None:
     vov_cfg.config.prefix_progress = False
     vov_agent = instantiate(vov_cfg)
     vov_agent.initialize()
+    vov_agent.to(device)
+    vov_agent.eval()
     if vov_agent.model._candidate_utility_head is not None or vov_agent.model._prefix_progress_head is not None:
         raise RuntimeError("VoV load constructed the R1 selector")
 
