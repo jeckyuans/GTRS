@@ -100,6 +100,17 @@ class HydraConfig(TransfuserConfig):
     backbone_wd: float = 0.0
     weight_decay: float = 0.0
 
+    # Frozen R1 selection. Off keeps the original 8-head Hydra argmax.
+    # Temporary absolute paths live in scripts/inference/frozen_gtrs_paths.sh.
+    spatial_path: bool = False
+    spatial_freeze: bool = True
+    spatial_plan_topk: int = 32
+    spatial_anchor_path: str = ""
+    candidate_utility: bool = False
+    candidate_utility_hidden_dim: int = 128
+    prefix_progress: bool = False
+    prefix_progress_hidden_dim: int = 128
+
     # lidar backbone
     lidar_architecture: str = "resnet34"
 
