@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+assets/
+*.npy
+*.npz
+*.pth
+*.ckpt

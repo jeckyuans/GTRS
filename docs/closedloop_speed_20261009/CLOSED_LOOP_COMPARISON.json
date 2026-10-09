@@ -1,0 +1,156 @@
+{
+  "tool": "/home/ys/sparsedrive/SparseDriveV2-wt/closedloop-speed-v1/tools/closedloop/compare_speed.py",
+  "args": {
+    "root": "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009"
+  },
+  "ckpt": "same frozen exact-checkpoint comparisons; see bound config receipts",
+  "n": 32,
+  "dataset": "fixed32 real AlpaSim probe, repaired native scoring",
+  "commit": "see each config.commits and per-file SHA256 closure",
+  "date": "2026-10-09T11:14:13Z",
+  "scope": "bounded paired speed validation; not a full-SDK runtime proof",
+  "comparisons": [
+    {
+      "model": "sparsedrive",
+      "n": 32,
+      "layout": "4x4",
+      "baseline_wall_s": 265.96557146683335,
+      "optimized_wall_s": 254.6855295225978,
+      "speedup": 1.0442900779065845,
+      "wall_reduction_percent": 4.241166208853542,
+      "mean_score_baseline": 0.9341648813443488,
+      "mean_score_optimized": 0.9341648813443488,
+      "score_differences": [],
+      "hard_failure_differences": [],
+      "submetric_differences": [],
+      "exact_score_and_hard_failure_parity": true,
+      "baseline_gpu_memory": {
+        "0": {
+          "used_mib": 13919,
+          "total_mib": 40960,
+          "samples": 123
+        },
+        "1": {
+          "used_mib": 12869,
+          "total_mib": 40960,
+          "samples": 123
+        },
+        "2": {
+          "used_mib": 12381,
+          "total_mib": 40960,
+          "samples": 123
+        },
+        "3": {
+          "used_mib": 12809,
+          "total_mib": 40960,
+          "samples": 123
+        }
+      },
+      "optimized_gpu_memory": {
+        "0": {
+          "used_mib": 12567,
+          "total_mib": 40960,
+          "samples": 118
+        },
+        "1": {
+          "used_mib": 13979,
+          "total_mib": 40960,
+          "samples": 118
+        },
+        "2": {
+          "used_mib": 11939,
+          "total_mib": 40960,
+          "samples": 118
+        },
+        "3": {
+          "used_mib": 12721,
+          "total_mib": 40960,
+          "samples": 118
+        }
+      },
+      "baseline_cpu_peak_cores": 24.460299483948162,
+      "optimized_cpu_peak_cores": 25.671709195788022,
+      "source_receipts": {
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_base32_v1/config.json": "9f2af38ad7545bd9afa8fd4c5fec768b520b3865963c40e4638cc42289874e3c",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_base32_v1/RESULT.json": "f617dd2d308f20b921e49da457a757a65f7965821586d5e6d6db3f100f0998d3",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_base32_v1/READY.json": "e2d0927a3e9f3fff6dbf0913be3ee9c7a52c159c811000f315692c94bd8045c0",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_base32_v1/aggregate/results-summary.json": "c8ad157675e53a6a37c95f337c2d9c9ade4cc640865439d7ef17e59dc437f03c",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_opt32_v2/config.json": "430f19530ade838238368a8d2df9999513889ae26696e350df56ef81b1e57e3d",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_opt32_v2/RESULT.json": "b3f1b9dee63ec3d4e07d2a1723e0130a955915046d1c9fbecd60fb927613fb6a",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_opt32_v2/READY.json": "e2d0927a3e9f3fff6dbf0913be3ee9c7a52c159c811000f315692c94bd8045c0",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/sparse_opt32_v2/aggregate/results-summary.json": "d5c0e8cb88026f44cbbfc3bd285bda483122ca44509f9706b7e9154593329781"
+      }
+    },
+    {
+      "model": "r1",
+      "n": 32,
+      "layout": "4x4",
+      "baseline_wall_s": 251.5612157508731,
+      "optimized_wall_s": 258.8038890622556,
+      "speedup": 0.9720148204201047,
+      "wall_reduction_percent": -2.879089803157542,
+      "mean_score_baseline": 0.8613345330329613,
+      "mean_score_optimized": 0.8613345330329613,
+      "score_differences": [],
+      "hard_failure_differences": [],
+      "submetric_differences": [],
+      "exact_score_and_hard_failure_parity": true,
+      "baseline_gpu_memory": {
+        "0": {
+          "used_mib": 11875,
+          "total_mib": 40960,
+          "samples": 116
+        },
+        "1": {
+          "used_mib": 11245,
+          "total_mib": 40960,
+          "samples": 116
+        },
+        "2": {
+          "used_mib": 10731,
+          "total_mib": 40960,
+          "samples": 116
+        },
+        "3": {
+          "used_mib": 10423,
+          "total_mib": 40960,
+          "samples": 116
+        }
+      },
+      "optimized_gpu_memory": {
+        "0": {
+          "used_mib": 11549,
+          "total_mib": 40960,
+          "samples": 119
+        },
+        "1": {
+          "used_mib": 11719,
+          "total_mib": 40960,
+          "samples": 119
+        },
+        "2": {
+          "used_mib": 10361,
+          "total_mib": 40960,
+          "samples": 119
+        },
+        "3": {
+          "used_mib": 10509,
+          "total_mib": 40960,
+          "samples": 119
+        }
+      },
+      "baseline_cpu_peak_cores": 25.99781774348215,
+      "optimized_cpu_peak_cores": 21.648756355140446,
+      "source_receipts": {
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_base32_v1/config.json": "ba48283c1fff7cadaca9b1ef5c66fec58af36b5f6db2ad714683500e8610d9c7",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_base32_v1/RESULT.json": "dcfc1f4f1de1ddff7544b5555c2f7aa116ff9a8b687e1864043bb32e5934b84d",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_base32_v1/READY.json": "92df3f2dfa615de02f911fddb749b12e6ab994a5fd77c84c12d0327287aa25d6",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_base32_v1/aggregate/results-summary.json": "f6712e2b39a2818a6ac68e97250ab0a225dc62265a6d4aeead1f421a24fd01b7",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_opt32_v2/config.json": "a391d63b85d31cbf630363d2376b0101e8cd864edd7ffc96db051e8e3b46d7dc",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_opt32_v2/RESULT.json": "6ac49ca1584fbe17f17fb34371cb895cf54dd70fdca896bf60a9aedd0fd31097",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_opt32_v2/READY.json": "92df3f2dfa615de02f911fddb749b12e6ab994a5fd77c84c12d0327287aa25d6",
+        "/ai/ys/alpasim_ws/runs/closedloop_speed_20261009/closed_loop/r1_opt32_v2/aggregate/results-summary.json": "c3d2d79ee8a0b1c62dfca10632ffe389b32237fd1091ee4911643f06a09b88ed"
+      }
+    }
+  ]
+}
