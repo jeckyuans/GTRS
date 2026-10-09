@@ -530,8 +530,22 @@ class GTRSDensePolicy:
             )
             LOGGER.info("GTRS-Dense policy warm-up completed")
 
+    def prepare_request(self, request: InferenceInput) -> dict[str, Tensor]:
+        """Pure CPU preprocessing; safe on independent RPC request threads."""
+        return {
+            "camera_feature": preprocess_images(request.images, dtype=torch.float32),
+            "status_feature": build_status_feature(
+                command_one_hot=request.command_one_hot,
+                velocity_xy=request.velocity_xy,
+                acceleration_xy=request.acceleration_xy,
+            ),
+        }
+
     def predict_batch(self, requests: list[InferenceInput]) -> list[Prediction]:
-        trajectories, debug = self.predict_batch_with_debug(requests)
+        return self.predict_prepared_batch([self.prepare_request(request) for request in requests])
+
+    def predict_prepared_batch(self, requests: list[dict[str, Tensor]]) -> list[Prediction]:
+        trajectories, debug = self._predict_prepared_with_debug(requests)
         return [
             Prediction(
                 trajectory=sample.copy(),
@@ -550,22 +564,23 @@ class GTRSDensePolicy:
         self, requests: list[InferenceInput]
     ) -> tuple[list[np.ndarray], list[dict[str, object]]]:
         """Same forward as predict_batch, plus the vocabulary scores it discards."""
+        return self._predict_prepared_with_debug([self.prepare_request(request) for request in requests])
+
+    def _predict_prepared_with_debug(
+        self, requests: list[dict[str, Tensor]]
+    ) -> tuple[list[np.ndarray], list[dict[str, object]]]:
         if not requests:
             return [], []
 
         camera_feature = torch.stack(
             [
-                preprocess_images(request.images, dtype=torch.float32)
+                request["camera_feature"]
                 for request in requests
             ]
         ).to(device=self.device, dtype=self.dtype)
         status_feature = torch.stack(
             [
-                build_status_feature(
-                    command_one_hot=request.command_one_hot,
-                    velocity_xy=request.velocity_xy,
-                    acceleration_xy=request.acceleration_xy,
-                )
+                request["status_feature"]
                 for request in requests
             ]
         ).to(device=self.device, dtype=self.dtype)

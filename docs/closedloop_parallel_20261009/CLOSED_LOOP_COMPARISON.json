@@ -1,0 +1,201 @@
+{
+  "tool": "/home/ys/sparsedrive/SparseDriveV2-wt/closedloop-parallel-v2/tools/closedloop/compare_speed.py",
+  "args": {
+    "root": "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009",
+    "r1_64": false
+  },
+  "ckpt": "same frozen exact-checkpoint comparisons; see bound config receipts",
+  "n": 32,
+  "dataset": "fixed32 real AlpaSim probe, repaired native scoring",
+  "commit": "see each config.commits and per-file SHA256 closure",
+  "date": "2026-10-09T13:35:41Z",
+  "scope": "bounded paired speed validation; not a full-SDK runtime proof",
+  "comparisons": [
+    {
+      "model": "sparsedrive",
+      "n": 32,
+      "layout": "4x4",
+      "baseline_wall_s": 270.9132971316576,
+      "optimized_wall_s": 234.06197192519903,
+      "speedup": 1.1574425990832693,
+      "wall_reduction_percent": 13.602626964651964,
+      "mean_score_baseline": 0.9341648813443488,
+      "mean_score_optimized": 0.9341648813443488,
+      "score_differences": [],
+      "hard_failure_differences": [],
+      "submetric_differences": [
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_00083_00485-0c318d7923d15b78",
+          "key": "dist_to_gt_trajectory",
+          "baseline": 0.10327615479261537,
+          "optimized": 0.10255163869020928
+        },
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_00083_00485-0c318d7923d15b78",
+          "key": "lateral_dist_to_gt_trajectory",
+          "baseline": 0.10327615479261537,
+          "optimized": 0.10255163869020928
+        },
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_00083_00485-0c318d7923d15b78",
+          "key": "progress_clipped_rel",
+          "baseline": 0.8913367711123871,
+          "optimized": 0.8919761697586416
+        },
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_00083_00485-0c318d7923d15b78",
+          "key": "progress_rel",
+          "baseline": 0.8913370853761484,
+          "optimized": 0.8919764736191472
+        }
+      ],
+      "exact_score_and_hard_failure_parity": true,
+      "baseline_gpu_memory": {
+        "0": {
+          "used_mib": 13311,
+          "total_mib": 40960,
+          "samples": 125
+        },
+        "1": {
+          "used_mib": 12639,
+          "total_mib": 40960,
+          "samples": 125
+        },
+        "2": {
+          "used_mib": 12749,
+          "total_mib": 40960,
+          "samples": 125
+        },
+        "3": {
+          "used_mib": 12015,
+          "total_mib": 40960,
+          "samples": 125
+        }
+      },
+      "optimized_gpu_memory": {
+        "0": {
+          "used_mib": 14159,
+          "total_mib": 40960,
+          "samples": 108
+        },
+        "1": {
+          "used_mib": 12541,
+          "total_mib": 40960,
+          "samples": 108
+        },
+        "2": {
+          "used_mib": 12591,
+          "total_mib": 40960,
+          "samples": 108
+        },
+        "3": {
+          "used_mib": 13105,
+          "total_mib": 40960,
+          "samples": 108
+        }
+      },
+      "baseline_cpu_peak_cores": 22.760661857817887,
+      "optimized_cpu_peak_cores": 21.823758218032744,
+      "source_receipts": {
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_serial32/config.json": "068f323233fddf241ea16c771682635c0418c0111936df061c6fc8c15ad5f986",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_serial32/RESULT.json": "cc9dad6b413cce75bb71ab196451bb2ea14aba1180bec5152249654875f8cd6a",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_serial32/READY.json": "e2d0927a3e9f3fff6dbf0913be3ee9c7a52c159c811000f315692c94bd8045c0",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_serial32/aggregate/results-summary.json": "3a2efc08fcb2242095a4e2d298e4118b6c6c7058bf317f550675e04a1815f4fb",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_parallel32/config.json": "f92b877fb04a823af7ced68acbbf3c2c3c063419d9213314074aaf4d13ef29fe",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_parallel32/RESULT.json": "7c451c01e7a68981fb9a9027d246f67f60977a0970b75a03c332a593004bb1eb",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_parallel32/READY.json": "e2d0927a3e9f3fff6dbf0913be3ee9c7a52c159c811000f315692c94bd8045c0",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/sparse_parallel32/aggregate/results-summary.json": "6e31a354aba29dd369fc698e6774bfd613425490d8c4e291bcd422ad2eda608c"
+      }
+    },
+    {
+      "model": "r1",
+      "n": 32,
+      "layout": "4x4",
+      "baseline_wall_s": 241.0506650172174,
+      "optimized_wall_s": 295.36494689807296,
+      "speedup": 0.8161112804641683,
+      "wall_reduction_percent": -22.532309494759573,
+      "mean_score_baseline": 0.8613345330329613,
+      "mean_score_optimized": 0.8613345330329613,
+      "score_differences": [],
+      "hard_failure_differences": [],
+      "submetric_differences": [
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_01100_01664-41d7b533797c5209",
+          "key": "dist_to_gt_trajectory",
+          "baseline": 0.5247808968783886,
+          "optimized": 0.7356811387128619
+        },
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_01100_01664-41d7b533797c5209",
+          "key": "lateral_dist_to_gt_trajectory",
+          "baseline": 0.5247808968783886,
+          "optimized": 0.7356811387128619
+        },
+        {
+          "scene": "2021.05.25.14.16.10_veh-35_01100_01664-41d7b533797c5209",
+          "key": "progress_clipped_rel",
+          "baseline": 1.0216884203708834,
+          "optimized": 1.0219243194363221
+        }
+      ],
+      "exact_score_and_hard_failure_parity": true,
+      "baseline_gpu_memory": {
+        "0": {
+          "used_mib": 12029,
+          "total_mib": 40960,
+          "samples": 111
+        },
+        "1": {
+          "used_mib": 11781,
+          "total_mib": 40960,
+          "samples": 111
+        },
+        "2": {
+          "used_mib": 11075,
+          "total_mib": 40960,
+          "samples": 111
+        },
+        "3": {
+          "used_mib": 9961,
+          "total_mib": 40960,
+          "samples": 111
+        }
+      },
+      "optimized_gpu_memory": {
+        "0": {
+          "used_mib": 10885,
+          "total_mib": 40960,
+          "samples": 136
+        },
+        "1": {
+          "used_mib": 10215,
+          "total_mib": 40960,
+          "samples": 136
+        },
+        "2": {
+          "used_mib": 10301,
+          "total_mib": 40960,
+          "samples": 136
+        },
+        "3": {
+          "used_mib": 11821,
+          "total_mib": 40960,
+          "samples": 136
+        }
+      },
+      "baseline_cpu_peak_cores": 23.202344185619527,
+      "optimized_cpu_peak_cores": 21.884764259110543,
+      "source_receipts": {
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_serial32_retry1/config.json": "b9c276be1489248ed886965bb24fbe31b865124ec2c771917e732e24dba5fbd0",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_serial32_retry1/RESULT.json": "a72999d4d5ed02fcd8b38bb309a50bacc7828d119134656fb6c0275182f6769b",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_serial32_retry1/READY.json": "92df3f2dfa615de02f911fddb749b12e6ab994a5fd77c84c12d0327287aa25d6",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_serial32_retry1/aggregate/results-summary.json": "997acb08758cf756335e41e1aead97950250e5ed36df9b6f4f88b088cc2a180a",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_parallel32/config.json": "c263c5975fe01f77178cdaddd59c33005852b89d6248b0ee7fd9a4a53e10ae22",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_parallel32/RESULT.json": "47f2c6ec9725d058cf81a0d0df697ec205e6ec36e5732297cae762e3606b1e36",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_parallel32/READY.json": "92df3f2dfa615de02f911fddb749b12e6ab994a5fd77c84c12d0327287aa25d6",
+        "/ai/ys/alpasim_ws/runs/closedloop_parallel_20261009/closed_loop/r1_parallel32/aggregate/results-summary.json": "612e4a252d92fb16dd8e882808ddee36be739d21d4c39841830f90106f064aee"
+      }
+    }
+  ]
+}

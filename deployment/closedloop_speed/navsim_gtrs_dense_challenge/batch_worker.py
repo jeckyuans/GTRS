@@ -25,7 +25,7 @@ class BatchPolicy(Protocol):
 
 @dataclass
 class _Pending:
-    request: InferenceInput
+    request: object
     future: Future[Prediction]
 
 
@@ -58,6 +58,14 @@ class BatchWorker:
         self._thread: threading.Thread | None = None
         self._stopping = False
         self._lifecycle_lock = threading.Lock()
+        # At most two batches may be preparing, queued or awaiting completion.
+        self._request_slots = threading.BoundedSemaphore(2 * self._max_batch_size)
+        prepare = getattr(policy, "prepare_request", None)
+        predict_prepared = getattr(policy, "predict_prepared_batch", None)
+        if callable(prepare) != callable(predict_prepared):
+            raise TypeError("policy preparation and prepared prediction must be provided together")
+        self._prepare = prepare if callable(prepare) else None
+        self._predict_batch = predict_prepared if callable(predict_prepared) else policy.predict_batch
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -76,15 +84,39 @@ class BatchWorker:
         request: InferenceInput,
         timeout: float | None = None,
     ) -> Prediction:
-        future: Future[Prediction] = Future()
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self._lifecycle_lock:
             self._reap_stopped_thread_locked()
             if self._stopping:
                 raise RuntimeError("batch worker is stopping")
             if self._thread is None:
                 raise RuntimeError("batch worker is not running")
-            self._queue.put(_Pending(request=request, future=future))
-        return future.result(timeout=timeout)
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if not self._request_slots.acquire(timeout=remaining):
+            raise TimeoutError("request preparation capacity wait timed out")
+        enqueued = False
+        try:
+            # The caller is an existing RPC thread. CPU-only preparation can
+            # overlap other sessions and the sole model worker's GPU forward.
+            prepared = self._prepare(request) if self._prepare is not None else request
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("request preparation timed out")
+            future: Future[Prediction] = Future()
+            future.add_done_callback(lambda _: self._request_slots.release())
+            with self._lifecycle_lock:
+                self._reap_stopped_thread_locked()
+                if self._stopping:
+                    raise RuntimeError("batch worker is stopping")
+                if self._thread is None:
+                    raise RuntimeError("batch worker is not running")
+                self._queue.put(_Pending(request=prepared, future=future))
+                enqueued = True
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            return future.result(timeout=remaining)
+        finally:
+            # A timed-out caller does not release a buffer still queued on GPU.
+            if not enqueued:
+                self._request_slots.release()
 
     def stop(self) -> None:
         with self._lifecycle_lock:
@@ -135,7 +167,7 @@ class BatchWorker:
 
             try:
                 LOGGER.info("gtrs_batch_size=%d", len(batch))
-                outputs = self._policy.predict_batch(
+                outputs = self._predict_batch(
                     [pending.request for pending in batch]
                 )
                 if len(outputs) != len(batch):

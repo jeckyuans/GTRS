@@ -1,14 +1,14 @@
 {
-  "original_tested_source": "/home/ys/alpasim_ws/worktrees/closedloop-speed-v1/e2e_challenge/sample_submission_simscale_navsim_gtrs_frozen",
-  "publication": "byte-identical runtime package, no weights/vocab binaries",
+  "original_tested_source": "closedloop-speed-v1 cache deployment plus parallel CPU preparation",
+  "publication": "updated parallel-policy runtime; model/checkpoint/selector unchanged",
   "sha256": {
     "navsim_gtrs_dense_challenge/driver.py": "384169168aabd0ab133062abf342ca14bec0b4ed4ecde2365e3a747e51bff9f0",
     "navsim_gtrs_dense_challenge/trajectory.py": "fa1977d6c48bc0f011d5054f34c6ec9dd8b10da5d0ab32b6d33e8c74054761e7",
     "navsim_gtrs_dense_challenge/__init__.py": "432b2b6fee8b3a36f522a0ba0f3937272683f0bf6923b379418dc9c49b9fe2ec",
-    "navsim_gtrs_dense_challenge/batch_worker.py": "7478a7e142e8503736cfe363167d559ba20b552ec81289414a3c486166922c27",
+    "navsim_gtrs_dense_challenge/batch_worker.py": "df7155548e2870855c60f92faf779d1e31a02b3e3326c4543d5f72ae5dca24af",
     "navsim_gtrs_dense_challenge/preprocessing.py": "6735b88225902643c60e506675730b29aaeda1c8297dc54248c0e8f99755738f",
     "navsim_gtrs_dense_challenge/navigation.py": "22941901d4a88969e94268fbdfedd64ddd262e5ed4bd15352797359556cddbab",
-    "navsim_gtrs_dense_challenge/policy.py": "6884a14299e4eb80a743ff6ce8a7e7d9cd2a40c49c99e825a9bbd97825fcb043",
+    "navsim_gtrs_dense_challenge/policy.py": "ddcb3860baf3d749c205b209c652d227d36e3e0d64da758617ab90435e865c2b",
     "navsim_gtrs_dense_challenge/tools/package_switch_gate.py": "e4d6b7aaa97c600ee711549bc4d9e044a95f82522df091dd5fa879a1f0a77005",
     "navsim_gtrs_dense_challenge/tools/__init__.py": "1ca49c15aeae274638f02b480aa6e2feaa0308b9c9c7baf1863ab9fb47519cb1",
     "navsim_gtrs_dense_challenge/tools/package_spatial_head.py": "63ab6e33a70af0c0e8983d05abdc1b2a90622f543acdef5e092cf5937b5975e2",
