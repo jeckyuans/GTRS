@@ -1,3 +1,6 @@
+# This deployment is a hash-bound copy of the GPU-tested runtime. Reformatting
+# it would invalidate the source receipts. Unified patches retain context blanks.
+exclude: ^(deployment/closedloop_speed/navsim_gtrs_dense_challenge/|scripts/closedloop/patches/)
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.3.0

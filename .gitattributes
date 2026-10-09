@@ -1,0 +1,3 @@
+# Preserve the bytes of the validated deployment source and unified-diff context.
+deployment/closedloop_speed/navsim_gtrs_dense_challenge/** whitespace=-blank-at-eof
+scripts/closedloop/patches/*.patch whitespace=-blank-at-eol

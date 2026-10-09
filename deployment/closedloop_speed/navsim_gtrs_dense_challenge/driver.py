@@ -1,0 +1,1131 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA Corporation
+
+from __future__ import annotations
+
+import logging
+import json
+import math
+import os
+import signal
+import threading
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from io import BytesIO
+from numbers import Integral, Real
+from typing import Protocol
+
+import numpy as np
+import torch
+from alpasim_grpc import API_VERSION_MESSAGE
+from alpasim_grpc.v0 import common_pb2, egodriver_pb2, egodriver_pb2_grpc
+from PIL import Image
+
+import grpc
+
+from .batch_worker import BatchPolicy, BatchWorker
+from .navigation import DriveCommand, command_from_route, command_one_hot
+from .policy import GTRSDensePolicy, InferenceInput, Prediction, SwitchChoice, temporal_switch_choice
+from .preprocessing import CAMERA_IDS
+from .simscale_gtrs_dense.model import (
+    NC_DAC_EP_BASED_SCORERS,
+    NC_DAC_EP_SCORER,
+    VALID_SCORER_MODES,
+    VALID_SPEED_PROXIES,
+)
+from .simscale_gtrs_dense.spatial_path import (
+    ROUTE_MIN_IMPROVEMENT,
+    ROUTE_MIN_REFERENCE_DEV,
+)
+from .trajectory import (
+    CachedPlan,
+    build_trajectory_from_plan,
+    cached_plan_covers_query,
+    make_cached_plan,
+    yaw_from_quat,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ScorerSettings:
+    speed_enhancement: bool
+    scorer_mode: str
+    ep_exponent: float
+    speed_top_k: int
+    speed_weight: float
+    speed_proxy: str
+    curvature_weight: float
+    heading_change_weight: float
+
+
+def _resolve_scorer_settings(environ: Mapping[str, str]) -> ScorerSettings:
+    speed_enhancement_value = environ.get("GTRS_SPEED_ENHANCEMENT", "1")
+    if speed_enhancement_value not in {"0", "1"}:
+        raise ValueError("GTRS_SPEED_ENHANCEMENT must be 0 or 1")
+    speed_enhancement = speed_enhancement_value == "1"
+    default_speed_top_k = "64" if speed_enhancement else "0"
+    default_speed_weight = "3.0" if speed_enhancement else "0.0"
+
+    scorer_mode = environ.get("GTRS_SCORER_MODE", NC_DAC_EP_SCORER)
+    if scorer_mode not in VALID_SCORER_MODES:
+        raise ValueError(
+            f"scorer_mode must be one of {sorted(VALID_SCORER_MODES)}; "
+            f"got {scorer_mode!r}"
+        )
+    default_ep_exponent = "3.0" if speed_enhancement else "1.0"
+    try:
+        ep_exponent = float(environ.get("GTRS_EP_EXPONENT", default_ep_exponent))
+    except ValueError as exc:
+        raise ValueError("GTRS_EP_EXPONENT must be a finite number in (0, 20]") from exc
+    if not math.isfinite(ep_exponent) or ep_exponent <= 0.0 or ep_exponent > 20.0:
+        raise ValueError("GTRS_EP_EXPONENT must be a finite number in (0, 20]")
+    try:
+        speed_top_k = int(environ.get("GTRS_SPEED_TOP_K", default_speed_top_k))
+    except ValueError as exc:
+        raise ValueError("GTRS_SPEED_TOP_K must be an integer in [0, 16384]") from exc
+    if speed_top_k < 0 or speed_top_k > 16384:
+        raise ValueError("GTRS_SPEED_TOP_K must be an integer in [0, 16384]")
+    try:
+        speed_weight = float(environ.get("GTRS_SPEED_WEIGHT", default_speed_weight))
+    except ValueError as exc:
+        raise ValueError("GTRS_SPEED_WEIGHT must be finite and non-negative") from exc
+    if not math.isfinite(speed_weight) or speed_weight < 0.0:
+        raise ValueError("GTRS_SPEED_WEIGHT must be finite and non-negative")
+    speed_proxy = environ.get("GTRS_SPEED_PROXY", "longitudinal")
+    if speed_proxy not in VALID_SPEED_PROXIES:
+        raise ValueError(
+            f"GTRS_SPEED_PROXY must be one of {sorted(VALID_SPEED_PROXIES)}; "
+            f"got {speed_proxy!r}"
+        )
+    try:
+        curvature_weight = float(environ.get("GTRS_CURVATURE_WEIGHT", "0.0"))
+    except ValueError as exc:
+        raise ValueError(
+            "GTRS_CURVATURE_WEIGHT must be finite and non-negative"
+        ) from exc
+    if not math.isfinite(curvature_weight) or curvature_weight < 0.0:
+        raise ValueError("GTRS_CURVATURE_WEIGHT must be finite and non-negative")
+    try:
+        heading_change_weight = float(environ.get("GTRS_HEADING_CHANGE_WEIGHT", "0.0"))
+    except ValueError as exc:
+        raise ValueError(
+            "GTRS_HEADING_CHANGE_WEIGHT must be finite and non-negative"
+        ) from exc
+    if not math.isfinite(heading_change_weight) or heading_change_weight < 0.0:
+        raise ValueError("GTRS_HEADING_CHANGE_WEIGHT must be finite and non-negative")
+    rerank_enabled = any(
+        weight > 0.0
+        for weight in (speed_weight, curvature_weight, heading_change_weight)
+    )
+    if rerank_enabled and speed_top_k == 0:
+        raise ValueError("GTRS_SPEED_TOP_K must be positive when reranking is enabled")
+    if rerank_enabled and scorer_mode not in NC_DAC_EP_BASED_SCORERS:
+        raise ValueError("reranking requires an NC/DAC/EP-based scorer")
+
+    return ScorerSettings(
+        speed_enhancement=speed_enhancement,
+        scorer_mode=scorer_mode,
+        ep_exponent=ep_exponent,
+        speed_top_k=speed_top_k,
+        speed_weight=speed_weight,
+        speed_proxy=speed_proxy,
+        curvature_weight=curvature_weight,
+        heading_change_weight=heading_change_weight,
+    )
+
+
+_RUNTIME_WRITE_DIR_DEFAULTS = {
+    "HOME": "/tmp/home",
+    "TMPDIR": "/tmp",
+    "XDG_CACHE_HOME": "/tmp/.cache",
+    "TORCH_HOME": "/tmp/torch",
+    "HF_HOME": "/tmp/huggingface",
+    "MPLCONFIGDIR": "/tmp/matplotlib",
+    "CUDA_CACHE_PATH": "/tmp/nv",
+    "NUMBA_CACHE_DIR": "/tmp/numba",
+    "TORCH_EXTENSIONS_DIR": "/tmp/torch_extensions",
+    "ALPASIM_DRIVER_LOG_DIR": "/run/alpasim-driver",
+}
+
+
+def _configure_runtime_write_dirs() -> None:
+    for key, default in _RUNTIME_WRITE_DIR_DEFAULTS.items():
+        os.environ.setdefault(key, default)
+    for key in _RUNTIME_WRITE_DIR_DEFAULTS:
+        path = os.environ[key]
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            if key != "ALPASIM_DRIVER_LOG_DIR":
+                raise
+            fallback = "/tmp/alpasim-driver"
+            os.environ[key] = fallback
+            os.makedirs(fallback, exist_ok=True)
+
+
+def _configure_torch_threads() -> None:
+    torch.set_num_threads(max(1, int(os.environ.get("TORCH_NUM_THREADS", "1"))))
+    torch.set_num_interop_threads(
+        max(1, int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1")))
+    )
+
+
+def decode_driver_image(logical_id: str, image_bytes: bytes) -> np.ndarray | None:
+    """Decode one driver camera. Unknown logical ids are ignored, as online."""
+    if logical_id not in CAMERA_IDS:
+        return None
+    with Image.open(BytesIO(image_bytes)) as decoded:
+        if decoded.size != (1920, 1080):
+            raise ValueError(
+                f"{logical_id} must decode to 1920x1080 RGB; got size {decoded.size}"
+            )
+        image = np.asarray(decoded.convert("RGB")).copy()
+    if image.shape != (1080, 1920, 3):
+        raise ValueError(
+            f"{logical_id} must decode to 1920x1080 RGB; got {image.shape}"
+        )
+    image.setflags(write=False)
+    return image
+
+
+def _pose_xy(pose: common_pb2.PoseAtTime) -> np.ndarray:
+    return np.array([pose.pose.vec.x, pose.pose.vec.y], dtype=np.float64)
+
+
+def _local_vector_to_rig(
+    vector_xy: np.ndarray,
+    reference_pose: common_pb2.PoseAtTime,
+) -> np.ndarray:
+    yaw = yaw_from_quat(reference_pose.pose.quat)
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    local_to_rig = np.array([[c, s], [-s, c]], dtype=np.float64)
+    return (local_to_rig @ vector_xy).astype(np.float32)
+
+
+def _derive_dynamics_from_poses(
+    poses: list[common_pb2.PoseAtTime],
+) -> tuple[np.ndarray, np.ndarray]:
+    zeros = np.zeros(2, dtype=np.float32)
+    if len(poses) < 2:
+        return zeros.copy(), zeros.copy()
+
+    previous, current = poses[-2:]
+    dt_current_s = (current.timestamp_us - previous.timestamp_us) / 1_000_000.0
+    if dt_current_s <= 1e-6:
+        return zeros.copy(), zeros.copy()
+
+    current_velocity_local = (_pose_xy(current) - _pose_xy(previous)) / dt_current_s
+    velocity_rig = _local_vector_to_rig(current_velocity_local, current)
+    if len(poses) < 3:
+        return velocity_rig, zeros.copy()
+
+    older = poses[-3]
+    dt_previous_s = (previous.timestamp_us - older.timestamp_us) / 1_000_000.0
+    if dt_previous_s <= 1e-6:
+        return velocity_rig, zeros.copy()
+
+    previous_velocity_local = (_pose_xy(previous) - _pose_xy(older)) / dt_previous_s
+    midpoint_dt_s = 0.5 * (dt_previous_s + dt_current_s)
+    acceleration_local = (
+        current_velocity_local - previous_velocity_local
+    ) / midpoint_dt_s
+    acceleration_rig = _local_vector_to_rig(acceleration_local, current)
+    return velocity_rig, acceleration_rig
+
+
+@dataclass
+class SessionCounters:
+    gtrs_inference: int = 0
+    cached_plan: int = 0
+    straight_fallback: int = 0
+    dynamic_state_fallback: int = 0
+    inference_error: int = 0
+
+
+@dataclass
+class SessionState:
+    images: dict[str, OrderedDict[int, np.ndarray]] = field(
+        default_factory=lambda: {camera_id: OrderedDict() for camera_id in CAMERA_IDS}
+    )
+    poses: list[common_pb2.PoseAtTime] = field(default_factory=list)
+    dynamics: list[tuple[int, common_pb2.DynamicState]] = field(default_factory=list)
+    command_one_hot: np.ndarray = field(
+        default_factory=lambda: command_one_hot(DriveCommand.UNKNOWN)
+    )
+    cached_plan: CachedPlan | None = None
+    # spatial_* from the same forward as cached_plan, for logs. With GTRS_SPATIAL_PATH=1
+    # cached_plan already holds the reranked unmodified candidate; trajectory_scored is
+    # the pre-rerank argmax.
+    spatial_plan: dict[str, np.ndarray] = field(default_factory=dict)
+    last_inference_timestamp_us: int | None = None
+    inference_inflight_timestamp_us: int | None = None
+    switch_positive_streak: int = 0
+    switch_confirmed: bool = False
+    counters: SessionCounters = field(default_factory=SessionCounters)
+
+    def add_image(
+        self,
+        camera_id: str,
+        timestamp_us: int,
+        image: np.ndarray,
+    ) -> None:
+        if camera_id not in self.images:
+            raise ValueError(f"unknown camera_id: {camera_id}")
+
+        cache = self.images[camera_id]
+        cache[int(timestamp_us)] = image
+        retained = sorted(cache.items())[-4:]
+        cache.clear()
+        cache.update(retained)
+
+    def synchronized_images(
+        self,
+        time_now_us: int,
+    ) -> tuple[int, dict[str, np.ndarray]]:
+        timestamp_us, images, _ = self.synchronized_images_with_timestamps(time_now_us)
+        return timestamp_us, images
+
+    def synchronized_images_with_timestamps(
+        self,
+        time_now_us: int,
+    ) -> tuple[int, dict[str, np.ndarray], dict[str, int]]:
+        eligible = {
+            camera_id: [
+                timestamp
+                for timestamp in self.images[camera_id]
+                if timestamp <= time_now_us
+            ]
+            for camera_id in CAMERA_IDS
+        }
+        if any(not timestamps for timestamps in eligible.values()):
+            raise LookupError("no complete synchronized camera set")
+
+        common_timestamps = set(eligible[CAMERA_IDS[0]])
+        for camera_id in CAMERA_IDS[1:]:
+            common_timestamps.intersection_update(eligible[camera_id])
+        if common_timestamps:
+            timestamp_us = max(common_timestamps)
+            return timestamp_us, {
+                camera_id: self.images[camera_id][timestamp_us]
+                for camera_id in CAMERA_IDS
+            }, {camera_id: timestamp_us for camera_id in CAMERA_IDS}
+
+        latest = {camera_id: max(eligible[camera_id]) for camera_id in CAMERA_IDS}
+        if max(latest.values()) - min(latest.values()) > 1_000:
+            raise LookupError("camera timestamps differ by more than 1 ms")
+
+        timestamp_us = max(latest.values())
+        return timestamp_us, {
+            camera_id: self.images[camera_id][latest[camera_id]]
+            for camera_id in CAMERA_IDS
+        }, latest
+
+    def add_egomotion(
+        self,
+        poses: list[common_pb2.PoseAtTime],
+        dynamic_states: list[common_pb2.DynamicState],
+    ) -> None:
+        if dynamic_states and len(dynamic_states) != len(poses):
+            raise ValueError(
+                "dynamic_states must be empty or correspond 1:1 with poses"
+            )
+
+        incoming_poses = {int(pose.timestamp_us): pose for pose in poses}
+        pose_by_time = {int(pose.timestamp_us): pose for pose in self.poses}
+        pose_by_time.update(incoming_poses)
+        self.poses = [
+            pose_by_time[timestamp_us] for timestamp_us in sorted(pose_by_time)[-32:]
+        ]
+
+        state_by_time = dict(self.dynamics)
+        for timestamp_us in incoming_poses:
+            state_by_time.pop(timestamp_us, None)
+        if dynamic_states:
+            state_by_time.update(
+                {
+                    int(pose.timestamp_us): state
+                    for pose, state in zip(poses, dynamic_states, strict=True)
+                }
+            )
+        self.dynamics = [
+            (timestamp_us, state_by_time[timestamp_us])
+            for timestamp_us in sorted(state_by_time)[-32:]
+        ]
+
+    def ego_snapshot(
+        self,
+        time_now_us: int,
+    ) -> tuple[common_pb2.PoseAtTime, np.ndarray, np.ndarray]:
+        eligible_poses = [
+            pose for pose in self.poses if pose.timestamp_us <= time_now_us
+        ]
+        if not eligible_poses:
+            raise LookupError("no ego pose at or before Drive time")
+
+        pose = eligible_poses[-1]
+        state = dict(self.dynamics).get(int(pose.timestamp_us))
+        if state is not None:
+            velocity = np.array(
+                [state.linear_velocity.x, state.linear_velocity.y],
+                dtype=np.float32,
+            )
+            acceleration = np.array(
+                [state.linear_acceleration.x, state.linear_acceleration.y],
+                dtype=np.float32,
+            )
+            return pose, velocity, acceleration
+
+        self.counters.dynamic_state_fallback += 1
+        velocity, acceleration = _derive_dynamics_from_poses(eligible_poses)
+        return pose, velocity, acceleration
+
+
+class PredictionWorker(Protocol):
+    def predict(
+        self,
+        request: InferenceInput,
+        timeout: float | None = None,
+    ) -> Prediction: ...
+
+
+class PolicyHandleLike(Protocol):
+    def start(self) -> None: ...
+
+    def wait_ready(self, timeout: float | None) -> bool: ...
+
+    def load_error(self) -> BaseException | None: ...
+
+    def worker(self) -> PredictionWorker | None: ...
+
+    def stop(self) -> None: ...
+
+
+class PolicyHandle:
+    def __init__(
+        self,
+        *,
+        loader: Callable[[], BatchPolicy],
+        max_batch_size: int = 2,
+        batch_window_s: float = 0.002,
+    ) -> None:
+        if (
+            isinstance(max_batch_size, bool)
+            or not isinstance(max_batch_size, Integral)
+            or max_batch_size <= 0
+        ):
+            raise ValueError("max_batch_size must be a positive integer")
+        if (
+            isinstance(batch_window_s, bool)
+            or not isinstance(batch_window_s, Real)
+            or not math.isfinite(batch_window_s)
+            or batch_window_s < 0
+        ):
+            raise ValueError("batch_window_s must be non-negative")
+
+        self._loader = loader
+        self._max_batch_size = int(max_batch_size)
+        self._batch_window_s = float(batch_window_s)
+        self._lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._worker: BatchWorker | None = None
+        self._load_error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_requested = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None or self._stop_requested:
+                return
+            self._thread = threading.Thread(
+                target=self._load,
+                name="gtrs-policy-loader",
+                daemon=True,
+            )
+            thread = self._thread
+        thread.start()
+
+    def wait_ready(self, timeout: float | None) -> bool:
+        return self._ready.wait(timeout)
+
+    def load_error(self) -> BaseException | None:
+        with self._lock:
+            return self._load_error
+
+    def worker(self) -> BatchWorker | None:
+        with self._lock:
+            if self._stop_requested:
+                return None
+            return self._worker
+
+    def stop(self) -> None:
+        with self._stop_lock:
+            with self._lock:
+                self._stop_requested = True
+                worker = self._worker
+            if worker is None:
+                return
+
+            worker.stop()
+            with self._lock:
+                if self._worker is worker:
+                    self._worker = None
+
+    def _load(self) -> None:
+        try:
+            with self._lock:
+                if self._stop_requested:
+                    return
+            policy = self._loader()
+            with self._lock:
+                if self._stop_requested:
+                    return
+
+            worker = BatchWorker(
+                policy,
+                max_batch_size=self._max_batch_size,
+                batch_window_s=self._batch_window_s,
+            )
+            worker.start()
+            with self._lock:
+                self._worker = worker
+                if self._stop_requested:
+                    publish = False
+                else:
+                    publish = True
+            if not publish:
+                self.stop()
+        except BaseException as exc:
+            with self._lock:
+                self._load_error = exc
+            LOGGER.exception("GTRS-Dense policy load failed")
+        finally:
+            self._ready.set()
+
+
+def _context_timeout(context: grpc.ServicerContext) -> float | None:
+    time_remaining = getattr(context, "time_remaining", None)
+    if not callable(time_remaining):
+        return None
+    remaining = time_remaining()
+    if remaining is None:
+        return None
+    try:
+        timeout = float(remaining)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if math.isnan(timeout) or timeout >= threading.TIMEOUT_MAX:
+        return None
+    return max(0.0, timeout)
+
+
+class NavsimGTRSDenseDriver(egodriver_pb2_grpc.EgodriverServiceServicer):
+    def __init__(
+        self,
+        policy_handle: PolicyHandleLike,
+        *,
+        trajectory_time_scale: float = 1.0,
+        switch_confirm_count: int | None = None,
+    ) -> None:
+        if (
+            not math.isfinite(trajectory_time_scale)
+            or not 1.0 <= trajectory_time_scale <= 1.25
+        ):
+            raise ValueError(
+                "GTRS_TRAJECTORY_TIME_SCALE must be finite and in [1.0, 1.25]"
+            )
+        self._policy_handle = policy_handle
+        self._trajectory_time_scale = trajectory_time_scale
+        self._sessions: dict[str, SessionState] = {}
+        self._lock = threading.RLock()
+        self._trace_jsonl = os.environ.get("GTRS_TRACE_JSONL") or None
+        configured_count = (
+            os.environ.get("GTRS_SWITCH_CONFIRM_COUNT", "0")
+            if switch_confirm_count is None else str(switch_confirm_count)
+        )
+        if configured_count not in ("0", "2"):
+            raise ValueError("GTRS_SWITCH_CONFIRM_COUNT must be 0 or 2")
+        self._switch_confirm_count = int(configured_count)
+        utility_mode = os.environ.get("GTRS_CANDIDATE_UTILITY", "0")
+        if utility_mode not in ("0", "1"):
+            raise ValueError("GTRS_CANDIDATE_UTILITY must be 0 or 1")
+        self._candidate_utility = utility_mode == "1"
+
+    def start_session(
+        self,
+        request: egodriver_pb2.DriveSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.SessionRequestStatus:
+        available = {
+            camera.logical_id
+            for camera in request.rollout_spec.vehicle.available_cameras
+        }
+        missing = sorted(set(CAMERA_IDS) - available)
+        if missing:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"missing required NAVSIM cameras: {missing}",
+            )
+            raise AssertionError("unreachable")
+
+        with self._lock:
+            previous = self._sessions.get(request.session_uuid)
+            if previous is not None:
+                previous.inference_inflight_timestamp_us = None
+            self._sessions[request.session_uuid] = SessionState()
+        LOGGER.info("started session %s", request.session_uuid)
+        return common_pb2.SessionRequestStatus()
+
+    def close_session(
+        self,
+        request: egodriver_pb2.DriveSessionCloseRequest,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.Empty:
+        with self._lock:
+            session = self._sessions.pop(request.session_uuid, None)
+            if session is not None:
+                session.inference_inflight_timestamp_us = None
+        LOGGER.info("closed session %s", request.session_uuid)
+        return common_pb2.Empty()
+
+    def submit_image_observation(
+        self,
+        request: egodriver_pb2.RolloutCameraImage,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.Empty:
+        session = self._get_session(request.session_uuid, context)
+        grpc_image = request.camera_image
+        try:
+            image = decode_driver_image(grpc_image.logical_id, grpc_image.image_bytes)
+        except (Image.DecompressionBombError, OSError, ValueError) as exc:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise AssertionError("unreachable") from exc
+        if image is None:
+            return common_pb2.Empty()
+
+        with self._lock:
+            if self._sessions.get(request.session_uuid) is session:
+                session.add_image(
+                    grpc_image.logical_id,
+                    int(grpc_image.frame_end_us),
+                    image,
+                )
+        return common_pb2.Empty()
+
+    def submit_egomotion_observation(
+        self,
+        request: egodriver_pb2.RolloutEgoTrajectory,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.Empty:
+        session = self._get_session(request.session_uuid, context)
+        poses = list(request.trajectory.poses)
+        dynamic_states = list(request.dynamic_states)
+        try:
+            with self._lock:
+                if self._sessions.get(request.session_uuid) is session:
+                    session.add_egomotion(poses, dynamic_states)
+        except ValueError as exc:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise AssertionError("unreachable") from exc
+        return common_pb2.Empty()
+
+    def submit_route(
+        self,
+        request: egodriver_pb2.RouteRequest,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.Empty:
+        session = self._get_session(request.session_uuid, context)
+        command = command_from_route(request.route)
+        with self._lock:
+            if self._sessions.get(request.session_uuid) is session:
+                session.command_one_hot = command
+        return common_pb2.Empty()
+
+    def submit_recording_ground_truth(
+        self,
+        request: egodriver_pb2.GroundTruthRequest,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.Empty:
+        self._get_session(request.session_uuid, context)
+        return common_pb2.Empty()
+
+    def drive(
+        self,
+        request: egodriver_pb2.DriveRequest,
+        context: grpc.ServicerContext,
+    ) -> egodriver_pb2.DriveResponse:
+        session = self._get_session(request.session_uuid, context)
+        time_now_us = int(request.time_now_us)
+        time_query_us = int(request.time_query_us)
+        worker = self._policy_handle.worker()
+
+        with self._lock:
+            try:
+                current_pose, current_velocity, current_acceleration = (
+                    session.ego_snapshot(time_now_us)
+                )
+            except LookupError as exc:
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                raise AssertionError("unreachable") from exc
+
+            image_timestamp_us: int | None = None
+            camera_timestamps_us: dict[str, int] | None = None
+            inference_input: InferenceInput | None = None
+            inference_pose: common_pb2.PoseAtTime | None = None
+            try:
+                image_timestamp_us, images, camera_timestamps_us = (
+                    session.synchronized_images_with_timestamps(time_now_us)
+                )
+                if image_timestamp_us == current_pose.timestamp_us:
+                    inference_pose = current_pose
+                    velocity = current_velocity
+                    acceleration = current_acceleration
+                else:
+                    inference_pose, velocity, acceleration = session.ego_snapshot(
+                        image_timestamp_us
+                    )
+                inference_input = InferenceInput(
+                    images=dict(images),
+                    command_one_hot=session.command_one_hot.copy(),
+                    velocity_xy=velocity.copy(),
+                    acceleration_xy=acceleration.copy(),
+                )
+            except LookupError:
+                inference_input = None
+
+            cached_before = session.cached_plan
+            timestamp_is_new = image_timestamp_us is not None and (
+                session.last_inference_timestamp_us is None
+                or image_timestamp_us > session.last_inference_timestamp_us
+            )
+            should_infer = (
+                worker is not None
+                and inference_input is not None
+                and inference_pose is not None
+                and timestamp_is_new
+                and session.inference_inflight_timestamp_us is None
+            )
+            if should_infer:
+                session.last_inference_timestamp_us = image_timestamp_us
+                session.inference_inflight_timestamp_us = image_timestamp_us
+                reserved_timestamp_us = image_timestamp_us
+            else:
+                reserved_timestamp_us = None
+
+        fresh_plan: CachedPlan | None = None
+        fresh_spatial: dict[str, np.ndarray] = {}
+        switch_choice: SwitchChoice | None = None
+        inference_error: Exception | None = None
+        if reserved_timestamp_us is not None:
+            assert worker is not None
+            assert inference_input is not None
+            assert inference_pose is not None
+            try:
+                try:
+                    prediction = worker.predict(
+                        inference_input,
+                        timeout=_context_timeout(context),
+                    )
+                    if self._switch_confirm_count == 2 and not self._candidate_utility:
+                        switch_choice = temporal_switch_choice(
+                            session.switch_positive_streak,
+                            session.switch_confirmed,
+                            prediction,
+                        )
+                    effective_trajectory = (
+                        switch_choice.trajectory if switch_choice is not None
+                        else prediction.trajectory
+                    )
+                    fresh_plan = make_cached_plan(
+                        reserved_timestamp_us,
+                        inference_pose,
+                        effective_trajectory,
+                        trajectory_time_scale=self._trajectory_time_scale,
+                    )
+                    fresh_spatial = dict(prediction.spatial)
+                    if switch_choice is not None:
+                        fresh_spatial["selected_indices_effective"] = np.asarray(
+                            switch_choice.selected_index
+                        )
+                        fresh_spatial["switch_temporal_confirmed"] = np.asarray(
+                            switch_choice.confirmed
+                        )
+                        LOGGER.info(
+                            "session=%s timestamp_us=%d selected_index=%d switch_reason=%s "
+                            "gate_probability=%.4f",
+                            request.session_uuid,
+                            reserved_timestamp_us,
+                            switch_choice.selected_index,
+                            switch_choice.reason,
+                            float(fresh_spatial["switch_gate_probability"]),
+                        )
+                    if self._trace_jsonl is not None:
+                        record = {
+                            "case_id": None,
+                            "category": None,
+                            "scene_id": None,
+                            "session_id": request.session_uuid,
+                            "camera_timestamp_us": camera_timestamps_us.get("CAM_F0") if camera_timestamps_us else None,
+                            "camera_timestamps_us": camera_timestamps_us,
+                            "input_asl": None,
+                            "event": None,
+                            "selected_vocab_index": (
+                                switch_choice.selected_index if switch_choice is not None
+                                else prediction.trace.get("selected_vocab_index")
+                            ),
+                            "predicted_path_xy": (
+                                fresh_spatial["spatial_path"].tolist()
+                                if "spatial_path" in fresh_spatial
+                                and np.isfinite(fresh_spatial["spatial_path"]).all()
+                                else None
+                            ),
+                            "selected_trajectory_xy": effective_trajectory[:, :2].tolist(),
+                            "risk": (
+                                prediction.trace.get("risk")
+                                if switch_choice is None or switch_choice.selected_index == prediction.trace.get("selected_vocab_index")
+                                else None
+                            ),
+                            "progress_m": prediction.trace.get("progress_m"),
+                            "fallback_reason": (
+                                switch_choice.reason if switch_choice is not None
+                                else prediction.trace.get("fallback_reason")
+                            ),
+                        }
+                        with self._lock:
+                            with open(self._trace_jsonl, "a", encoding="utf-8") as stream:
+                                stream.write(json.dumps(record, allow_nan=False) + "\n")
+                except Exception as exc:
+                    inference_error = exc
+                    LOGGER.exception(
+                        "GTRS-Dense inference failed for session %s timestamp_us=%d",
+                        request.session_uuid,
+                        reserved_timestamp_us,
+                    )
+            finally:
+                with self._lock:
+                    if session.inference_inflight_timestamp_us == reserved_timestamp_us:
+                        session.inference_inflight_timestamp_us = None
+
+        counter_values: tuple[int, int, int, int, int] | None = None
+        with self._lock:
+            active_session = self._sessions.get(request.session_uuid)
+            if active_session is session:
+                if inference_error is not None:
+                    session.counters.inference_error += 1
+                if fresh_plan is not None:
+                    if switch_choice is not None:
+                        session.switch_positive_streak = switch_choice.positive_streak
+                        session.switch_confirmed = switch_choice.confirmed
+                    session.cached_plan = fresh_plan
+                    session.spatial_plan = fresh_spatial
+                    session.counters.gtrs_inference += 1
+                    if fresh_spatial:
+                        if self._candidate_utility:
+                            LOGGER.debug(
+                                "session=%s spatial_mode=%d spatial_path=%s "
+                                "scored_index=%d utility_index=%d",
+                                request.session_uuid,
+                                int(fresh_spatial["spatial_mode"]),
+                                np.round(fresh_spatial["spatial_path"], 2).tolist(),
+                                int(fresh_spatial["selected_indices_scored"]),
+                                int(prediction.trace["selected_vocab_index"]),
+                            )
+                        else:
+                            LOGGER.debug(
+                                "session=%s spatial_mode=%d spatial_path=%s "
+                                "scored_index=%d deviation=%.2f route_pool=%d",
+                                request.session_uuid,
+                                int(fresh_spatial["spatial_mode"]),
+                                np.round(fresh_spatial["spatial_path"], 2).tolist(),
+                                int(fresh_spatial["selected_indices_scored"]),
+                                float(fresh_spatial["spatial_rerank_deviation"]),
+                                int(fresh_spatial["spatial_route_pool_size"]),
+                            )
+
+                response_plan = session.cached_plan
+                if fresh_plan is None:
+                    if cached_plan_covers_query(
+                        response_plan, time_now_us, time_query_us
+                    ):
+                        session.counters.cached_plan += 1
+                    else:
+                        session.counters.straight_fallback += 1
+                counter_values = (
+                    session.counters.gtrs_inference,
+                    session.counters.cached_plan,
+                    session.counters.straight_fallback,
+                    session.counters.dynamic_state_fallback,
+                    session.counters.inference_error,
+                )
+            else:
+                response_plan = fresh_plan if fresh_plan is not None else cached_before
+
+        trajectory = build_trajectory_from_plan(
+            response_plan,
+            current_pose,
+            time_now_us,
+            time_query_us,
+            fallback_speed_mps=float(np.linalg.norm(current_velocity)),
+        )
+        if counter_values is not None:
+            LOGGER.info(
+                "session=%s gtrs_inference=%d cached_plan=%d "
+                "straight_fallback=%d dynamic_state_fallback=%d "
+                "inference_error=%d",
+                request.session_uuid,
+                *counter_values,
+            )
+        return egodriver_pb2.DriveResponse(trajectory=trajectory)
+
+    def get_version(
+        self,
+        request: common_pb2.Empty,
+        context: grpc.ServicerContext,
+    ) -> common_pb2.VersionId:
+        timeout = _context_timeout(context)
+        if timeout is None:
+            timeout = 30.0
+        else:
+            timeout = min(timeout, 30.0)
+        if not self._policy_handle.wait_ready(timeout):
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "GTRS-Dense policy readiness timed out",
+            )
+            raise AssertionError("unreachable")
+
+        load_error = self._policy_handle.load_error()
+        if load_error is not None:
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                f"GTRS-Dense policy load failed: {load_error}",
+            )
+            raise AssertionError("unreachable")
+        if self._policy_handle.worker() is None:
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "GTRS-Dense policy reported ready without a batch worker",
+            )
+            raise AssertionError("unreachable")
+
+        return common_pb2.VersionId(
+            version_id=os.environ.get(
+                "GTRS_SERVICE_VERSION",
+                "simscale-gtrs-dense-e2e",
+            ),
+            git_hash=os.environ.get("GTRS_GIT_HASH", "local"),
+            grpc_api_version=API_VERSION_MESSAGE,
+        )
+
+    def stop(self) -> None:
+        self._policy_handle.stop()
+
+    def _get_session(
+        self,
+        session_uuid: str,
+        context: grpc.ServicerContext,
+    ) -> SessionState:
+        with self._lock:
+            session = self._sessions.get(session_uuid)
+        if session is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"unknown session {session_uuid}")
+            raise AssertionError("unreachable")
+        return session
+
+
+def main() -> None:
+    _configure_runtime_write_dirs()
+    _configure_torch_threads()
+    logging.basicConfig(
+        level=os.environ.get("ALPASIM_DRIVER_LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    host = os.environ.get("ALPASIM_DRIVER_HOST", "0.0.0.0")
+    port = int(os.environ.get("ALPASIM_DRIVER_PORT", "6789"))
+    backbone_type = os.environ.get("GTRS_BACKBONE", "resnet")
+    default_checkpoint = (
+        "/app/assets/gtrs_dense/gtrs_dense_vov_sim_reward_navhard.ckpt"
+        if backbone_type == "vov"
+        else "/app/assets/gtrs_dense/gtrs_dense_resnet_sim_reward_navhard.ckpt"
+    )
+    checkpoint_path = os.environ.get("GTRS_CHECKPOINT_PATH", default_checkpoint)
+    vocabulary_path = os.environ.get(
+        "GTRS_VOCAB_PATH",
+        "/app/assets/gtrs_dense/navsim_16384.npy",
+    )
+    device = os.environ.get("GTRS_DEVICE", "cuda")
+    try:
+        trajectory_time_scale = float(
+            os.environ.get("GTRS_TRAJECTORY_TIME_SCALE", "1.0")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "GTRS_TRAJECTORY_TIME_SCALE must be finite and in [1.0, 1.25]"
+        ) from exc
+    if (
+        not math.isfinite(trajectory_time_scale)
+        or not 1.0 <= trajectory_time_scale <= 1.25
+    ):
+        raise ValueError("GTRS_TRAJECTORY_TIME_SCALE must be finite and in [1.0, 1.25]")
+    scorer_settings = _resolve_scorer_settings(os.environ)
+    spatial_path = os.environ.get("GTRS_SPATIAL_PATH", "0") == "1"
+    spatial_anchor_path = os.environ.get("GTRS_SPATIAL_ANCHOR_PATH") or None
+    spatial_plan_topk = int(os.environ.get("GTRS_SPATIAL_PLAN_TOPK", "32"))
+    # Route-constrained pick: rows within this many base-score units of the best compete.
+    spatial_rerank_score_margin = float(
+        os.environ.get("GTRS_SPATIAL_RERANK_SCORE_MARGIN", "1.0")
+    )
+    # 0 lets rows much shorter than the scored pick compete in the route pick.
+    spatial_route_arc_gate_env = os.environ.get("GTRS_SPATIAL_ROUTE_ARC_GATE", "1")
+    if spatial_route_arc_gate_env not in ("0", "1"):
+        raise ValueError("GTRS_SPATIAL_ROUTE_ARC_GATE must be 0 or 1")
+    spatial_route_arc_gate = spatial_route_arc_gate_env == "1"
+    # The route pick keeps the scored pick while its own max deviation from the path is
+    # below this many metres; 0 lets any qualifying row replace it.
+    spatial_route_min_reference_dev = float(
+        os.environ.get("GTRS_SPATIAL_RERANK_MIN_REF_DEV", str(ROUTE_MIN_REFERENCE_DEV))
+    )
+    if (
+        not math.isfinite(spatial_route_min_reference_dev)
+        or spatial_route_min_reference_dev < 0.0
+    ):
+        raise ValueError("GTRS_SPATIAL_RERANK_MIN_REF_DEV must be finite and >= 0")
+    # ... and while the best row is not at least this many metres closer than the
+    # scored pick; 0 turns this gate off.
+    spatial_route_min_improvement = float(
+        os.environ.get("GTRS_SPATIAL_RERANK_MIN_IMPROVEMENT", str(ROUTE_MIN_IMPROVEMENT))
+    )
+    if (
+        not math.isfinite(spatial_route_min_improvement)
+        or spatial_route_min_improvement < 0.0
+    ):
+        raise ValueError("GTRS_SPATIAL_RERANK_MIN_IMPROVEMENT must be finite and >= 0")
+    # Unset: the route pick's arc gate is centred on the scored pick's arc. Set: on
+    # this fraction of it, so rows shorter than an over-fast scored pick compete.
+    spatial_route_arc_center_scale_env = os.environ.get(
+        "GTRS_SPATIAL_ROUTE_ARC_CENTER_SCALE", ""
+    )
+    spatial_route_arc_center_scale = None
+    if spatial_route_arc_center_scale_env:
+        try:
+            spatial_route_arc_center_scale = float(spatial_route_arc_center_scale_env)
+        except ValueError as exc:
+            raise ValueError(
+                "GTRS_SPATIAL_ROUTE_ARC_CENTER_SCALE must be finite and > 0"
+            ) from exc
+        if (
+            not math.isfinite(spatial_route_arc_center_scale)
+            or spatial_route_arc_center_scale <= 0.0
+        ):
+            raise ValueError("GTRS_SPATIAL_ROUTE_ARC_CENTER_SCALE must be finite and > 0")
+    # VoV checkpoint whose spatial head supplies the path while GTRS_CHECKPOINT_PATH
+    # keeps scoring. Needs GTRS_SPATIAL_PATH=1.
+    spatial_path_checkpoint = os.environ.get("GTRS_SPATIAL_PATH_CHECKPOINT") or None
+    da_progress_checkpoint = os.environ.get("GTRS_DA_PROGRESS_CHECKPOINT") or None
+    spatial_reference_safety_gate_env = os.environ.get(
+        "GTRS_SPATIAL_REFERENCE_SAFETY_GATE", "0"
+    )
+    if spatial_reference_safety_gate_env not in ("0", "1"):
+        raise ValueError("GTRS_SPATIAL_REFERENCE_SAFETY_GATE must be 0 or 1")
+    spatial_reference_safety_gate = spatial_reference_safety_gate_env == "1"
+    # Diagnostic only: 1 executes the spatial path at the scored pick's arc lengths
+    # instead of the route-picked vocabulary row. Needs GTRS_SPATIAL_PATH=1.
+    spatial_execute_path_env = os.environ.get("GTRS_SPATIAL_EXECUTE_PATH", "0")
+    if spatial_execute_path_env not in ("0", "1"):
+        raise ValueError("GTRS_SPATIAL_EXECUTE_PATH must be 0 or 1")
+    spatial_execute_path = spatial_execute_path_env == "1"
+    candidate_utility_env = os.environ.get("GTRS_CANDIDATE_UTILITY", "0")
+    if candidate_utility_env not in ("0", "1"):
+        raise ValueError("GTRS_CANDIDATE_UTILITY must be 0 or 1")
+    candidate_utility = candidate_utility_env == "1"
+    prefix_progress_env = os.environ.get("GTRS_PREFIX_PROGRESS", "0")
+    if prefix_progress_env not in ("0", "1"):
+        raise ValueError("GTRS_PREFIX_PROGRESS must be 0 or 1")
+    prefix_progress = prefix_progress_env == "1"
+    if prefix_progress and not candidate_utility:
+        raise ValueError("GTRS_PREFIX_PROGRESS requires GTRS_CANDIDATE_UTILITY=1")
+    prefix_base_sha256 = os.environ.get("GTRS_PREFIX_BASE_SHA256") or None
+    max_batch_size = int(os.environ.get("GTRS_MAX_BATCH_SIZE", "1"))
+    batch_window_s = float(os.environ.get("GTRS_BATCH_WINDOW_MS", "2")) / 1000.0
+
+    policy_handle = PolicyHandle(
+        loader=lambda: GTRSDensePolicy(
+            checkpoint_path,
+            vocabulary_path,
+            device=device,
+            scorer_mode=scorer_settings.scorer_mode,
+            ep_exponent=scorer_settings.ep_exponent,
+            speed_top_k=scorer_settings.speed_top_k,
+            speed_weight=scorer_settings.speed_weight,
+            speed_proxy=scorer_settings.speed_proxy,
+            curvature_weight=scorer_settings.curvature_weight,
+            heading_change_weight=scorer_settings.heading_change_weight,
+            backbone_type=backbone_type,
+            spatial_path=spatial_path,
+            spatial_anchor_path=spatial_anchor_path,
+            spatial_plan_topk=spatial_plan_topk,
+            spatial_rerank_score_margin=spatial_rerank_score_margin,
+            spatial_route_arc_gate=spatial_route_arc_gate,
+            spatial_path_checkpoint=spatial_path_checkpoint,
+            spatial_route_min_reference_dev=spatial_route_min_reference_dev,
+            spatial_route_min_improvement=spatial_route_min_improvement,
+            spatial_route_arc_center_scale=spatial_route_arc_center_scale,
+            spatial_execute_path=spatial_execute_path,
+            da_progress_checkpoint=da_progress_checkpoint,
+            spatial_reference_safety_gate=spatial_reference_safety_gate,
+            candidate_utility=candidate_utility,
+            prefix_progress=prefix_progress,
+            prefix_base_sha256=prefix_base_sha256,
+        ),
+        max_batch_size=max_batch_size,
+        batch_window_s=batch_window_s,
+    )
+    service = NavsimGTRSDenseDriver(
+        policy_handle,
+        trajectory_time_scale=trajectory_time_scale,
+    )
+    grpc_workers = max(
+        1,
+        int(os.environ.get("ALPASIM_DRIVER_GRPC_WORKERS", "4")),
+    )
+    server = grpc.server(ThreadPoolExecutor(max_workers=grpc_workers))
+    egodriver_pb2_grpc.add_EgodriverServiceServicer_to_server(service, server)
+
+    bound_port = server.add_insecure_port(f"{host}:{port}")
+    if bound_port == 0:
+        server.stop(grace=0.0)
+        service.stop()
+        raise RuntimeError(f"failed to bind {host}:{port}")
+
+    def request_stop(signum: int, frame: object) -> None:
+        LOGGER.info("received signal %s, stopping", signum)
+        server.stop(grace=0.0)
+        service.stop()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    try:
+        server.start()
+        LOGGER.info(
+            "SimScale GTRS-Dense driver listening on %s:%d; "
+            "trajectory_time_scale=%s",
+            host,
+            bound_port,
+            trajectory_time_scale,
+        )
+        policy_handle.start()
+        server.wait_for_termination()
+    finally:
+        server.stop(grace=0.0)
+        service.stop()
+
+
+if __name__ == "__main__":
+    main()

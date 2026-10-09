@@ -1,0 +1,90 @@
+diff --git a/plugins/mtgs/server/servicer.py b/plugins/mtgs/server/servicer.py
+index 60e64eb..866ca9e 100644
+--- a/plugins/mtgs/server/servicer.py
++++ b/plugins/mtgs/server/servicer.py
+@@ -10,6 +10,8 @@ allowing it to replace the default sensorsim in alpasim.
+ from __future__ import annotations
+ 
+ import logging
++import threading
++from concurrent.futures import Future
+ from pathlib import Path
+ from typing import Dict
+ 
+@@ -65,6 +67,8 @@ class MTGSSensorsimService(SensorsimServiceServicer):
+         self.get_scene = get_scene
+         self.get_available_scene_ids = get_available_scene_ids
+         self.device = device
++        if not isinstance(cache_size, int) or cache_size < 1:
++            raise ValueError("renderer cache_size must be a positive integer")
+         self.cache_size = cache_size
+ 
+         logger.info(
+@@ -73,10 +77,51 @@ class MTGSSensorsimService(SensorsimServiceServicer):
+ 
+         self._renderer_cache: Dict[str, MTGS] = {}
+         self._loaded_scene_ids: set[str] = set()
++        self._renderer_cache_lock = threading.Condition(threading.RLock())
++        self._renderer_loading: dict[str, Future] = {}
+ 
+     def get_renderer(self, scene_id: str) -> MTGS:
+-        if scene_id in self._renderer_cache:
+-            return self._renderer_cache[scene_id]
++        # Concurrent camera RPCs must not construct duplicate GPU scene models.
++        with self._renderer_cache_lock:
++            while True:
++                if scene_id in self._renderer_cache:
++                    return self._renderer_cache[scene_id]
++                if scene_id in self._renderer_loading:
++                    pending = self._renderer_loading[scene_id]
++                    owner = False
++                    break
++                if len(self._renderer_cache) + len(self._renderer_loading) < self.cache_size:
++                    pending = Future()
++                    self._renderer_loading[scene_id] = pending
++                    owner = True
++                    break
++                if self._renderer_cache:
++                    oldest_key = next(iter(self._renderer_cache))
++                    del self._renderer_cache[oldest_key]
++                    # Count pending loads too; evict before allocating the next
++                    # model. Active render RPCs retain their own references.
++                    torch.cuda.empty_cache()
++                else:
++                    self._renderer_cache_lock.wait()
++        if not owner:
++            return pending.result()
++        try:
++            renderer = self._load_renderer(scene_id)
++        except BaseException as error:
++            with self._renderer_cache_lock:
++                pending.set_exception(error)
++                del self._renderer_loading[scene_id]
++                self._renderer_cache_lock.notify_all()
++            raise
++        with self._renderer_cache_lock:
++            self._renderer_cache[scene_id] = renderer
++            self._loaded_scene_ids.add(scene_id)
++            pending.set_result(renderer)
++            del self._renderer_loading[scene_id]
++            self._renderer_cache_lock.notify_all()
++        return renderer
++
++    def _load_renderer(self, scene_id: str) -> MTGS:
+ 
+         logger.info(f"Renderer cache miss, loading for scene {scene_id}")
+ 
+@@ -206,13 +251,6 @@ class MTGSSensorsimService(SensorsimServiceServicer):
+         renderer._scene_id = scene_id
+         renderer._asset_id = asset_id
+ 
+-        if len(self._renderer_cache) >= self.cache_size:
+-            oldest_key = next(iter(self._renderer_cache))
+-            del self._renderer_cache[oldest_key]
+-            torch.cuda.empty_cache()
+-
+-        self._renderer_cache[scene_id] = renderer
+-        self._loaded_scene_ids.add(scene_id)
+         return renderer
+ 
+     def get_version(self, request: Empty, context: grpc.ServicerContext) -> VersionId:

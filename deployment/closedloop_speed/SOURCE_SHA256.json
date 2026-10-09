@@ -1,0 +1,32 @@
+{
+  "original_tested_source": "closedloop-speed-v1 cache deployment plus parallel CPU preparation",
+  "publication": "updated parallel-policy runtime; model/checkpoint/selector unchanged",
+  "sha256": {
+    "navsim_gtrs_dense_challenge/driver.py": "384169168aabd0ab133062abf342ca14bec0b4ed4ecde2365e3a747e51bff9f0",
+    "navsim_gtrs_dense_challenge/trajectory.py": "fa1977d6c48bc0f011d5054f34c6ec9dd8b10da5d0ab32b6d33e8c74054761e7",
+    "navsim_gtrs_dense_challenge/__init__.py": "432b2b6fee8b3a36f522a0ba0f3937272683f0bf6923b379418dc9c49b9fe2ec",
+    "navsim_gtrs_dense_challenge/batch_worker.py": "df7155548e2870855c60f92faf779d1e31a02b3e3326c4543d5f72ae5dca24af",
+    "navsim_gtrs_dense_challenge/preprocessing.py": "6735b88225902643c60e506675730b29aaeda1c8297dc54248c0e8f99755738f",
+    "navsim_gtrs_dense_challenge/navigation.py": "22941901d4a88969e94268fbdfedd64ddd262e5ed4bd15352797359556cddbab",
+    "navsim_gtrs_dense_challenge/policy.py": "ddcb3860baf3d749c205b209c652d227d36e3e0d64da758617ab90435e865c2b",
+    "navsim_gtrs_dense_challenge/tools/package_switch_gate.py": "e4d6b7aaa97c600ee711549bc4d9e044a95f82522df091dd5fa879a1f0a77005",
+    "navsim_gtrs_dense_challenge/tools/__init__.py": "1ca49c15aeae274638f02b480aa6e2feaa0308b9c9c7baf1863ab9fb47519cb1",
+    "navsim_gtrs_dense_challenge/tools/package_spatial_head.py": "63ab6e33a70af0c0e8983d05abdc1b2a90622f543acdef5e092cf5937b5975e2",
+    "navsim_gtrs_dense_challenge/tools/compute_tracking_error.py": "040366266002da60f740465e770c62a4728fb129ced5b0bbbd216481a297de22",
+    "navsim_gtrs_dense_challenge/tools/offline_rescore_asl.py": "cef97ae4380fa297661975c4d2818697ec1752c24cd0abde8d150b92e6c605a8",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/da_progress.py": "e3ef0eb5b75821b6fdc908a673595a08405c31e6e55ec10e5f8548bd1519f357",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/NOTICE.md": "8927a1ea189525acfc45dc918da28aed2a8dd6d1ab6ce9bbe27961b5cf61e24a",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/attention.py": "845d8871b6d9c08e7e99856e22035fe8e3952f628f1ed2548abfaa14a9b746af",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/candidate_utility.py": "3055977120ec83ef8a599d6ce5e0e1b3f1cd09c02a8c209eec76266c7a7a60a8",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/model.py": "6435d4cb32d18f3d4ce8ec37002bed5b2ad99bc45cbb3ce31df150a081d8218b",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/vov.py": "472e4c7beff08de0f0c313964cc7c1df3f624ce71f9058a995d461a30c52b2e6",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/inference_cache.py": "35a7616d5d5385f9f7a8d075a587badc7c1daf234599ce095bd3de2167c1e673",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/__init__.py": "d6918650ef5ba7d65157c0f3a9523aed120f1ddf27d4e9a69a8e4a087ed735d3",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/spatial_path.py": "268b488df66043abfd03258eaf3dff21dff67b51179adc7960a05372251ad0f5",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/switch_gate.py": "d5b4b212f51c7c650c375ed98d0857b85def26a2365d2d156aa0af03b30a209d",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/config.py": "73f8613007fbd590d7c3ea247f8c44f986bbc729c43071d61a49076c90a3a1ac",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/prefix_progress.py": "36c29777ed09b57223e0db5331ab5cd76d628e98c281d63d0fad3d902f60b6ea",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/backbone.py": "99f47acf4d2fd62ff23d3f68f03aedd67b8d2d08e6e3b4ed816dc4565e152443",
+    "navsim_gtrs_dense_challenge/simscale_gtrs_dense/LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  }
+}
